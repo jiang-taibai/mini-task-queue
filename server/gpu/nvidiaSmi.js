@@ -5,6 +5,19 @@ import { promisify } from 'node:util'
 const execFileAsync = promisify(execFile)
 
 /**
+ * 从 nvidia-smi 的一个字段里取数值。
+ *
+ * 不直接用 Number()：部分驱动版本对 `--query-compute-apps` 的 used_memory
+ * 不认 `nounits`，仍然输出 "16870 MiB"，Number() 会得到 NaN，
+ * 于是显存峰值采集和预留的提前解除会静默失效——不报错，只是永远算不出数。
+ * 不支持的字段则返回 "[N/A]"，这里一并归为 NaN 由调用方处理。
+ */
+function parseNumeric (value) {
+  const match = String(value).match(/-?\d+(?:\.\d+)?/)
+  return match ? Number(match[0]) : NaN
+}
+
+/**
  * 真实 GPU 数据源。
  *
  * 两条通道，刻意用了不同的机制：
@@ -48,7 +61,7 @@ export class NvidiaSmiSource extends EventEmitter {
     ])
     this.staticInfo = stdout.trim().split('\n').filter(Boolean).map(line => {
       const [index, uuid, name, memTotal] = line.split(',').map(s => s.trim())
-      return { index: Number(index), uuid, name, memTotalMb: Number(memTotal) }
+      return { index: parseNumeric(index), uuid, name, memTotalMb: parseNumeric(memTotal) }
     })
     if (this.staticInfo.length === 0) throw new Error('nvidia-smi 未返回任何 GPU')
     for (const d of this.staticInfo) this.uuidToIndex.set(d.uuid, d.index)
@@ -95,7 +108,7 @@ export class NvidiaSmiSource extends EventEmitter {
       const parts = line.split(',').map(s => s.trim())
       if (parts.length < 5) continue
 
-      const [index, memTotal, memUsed, memFree, util] = parts.map(Number)
+      const [index, memTotal, memUsed, memFree, util] = parts.map(parseNumeric)
       if (Number.isNaN(index)) continue
 
       this.pending.push({
@@ -136,10 +149,10 @@ export class NvidiaSmiSource extends EventEmitter {
           const [uuid, pid, mem] = line.split(',').map(s => s.trim())
           return {
             gpuIndex: this.uuidToIndex.get(uuid) ?? null,
-            pid: Number(pid),
-            usedMemoryMb: Number(mem)
+            pid: parseNumeric(pid),
+            usedMemoryMb: parseNumeric(mem)
           }
-        }).filter(p => !Number.isNaN(p.pid))
+        }).filter(p => !Number.isNaN(p.pid) && !Number.isNaN(p.usedMemoryMb))
       } catch {
         this.processes = []
         this.processesAvailable = false
