@@ -117,17 +117,26 @@ export function createAuthMiddleware ({ sessions, cfg }) {
    * 另开一个标签页访问了恶意网页，那个页面就能向本服务发 POST，
    * 浏览器自动带上 Cookie，于是以你的身份执行任意命令——你什么都没点。
    */
+  // 尾部斜杠是配置时最容易写错的地方：浏览器发的 Origin 永远不带斜杠，
+  // 而人手写配置时很容易带上，比较前统一去掉
+  const normalizeOrigin = value => String(value).trim().replace(/\/+$/, '')
+
   const checkOrigin = (req, res, next) => {
     if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next()
 
     const origin = req.get('origin')
     if (!origin) return next() // 非浏览器客户端（curl 等）没有 Origin
 
-    const allowed = cfg.allowedOrigins ?? []
+    const allowed = (cfg.allowedOrigins ?? []).map(normalizeOrigin)
     if (allowed.length === 0) return next() // 未配置则跳过，便于本地开发
 
-    if (!allowed.includes(origin)) {
-      return res.status(403).json({ error: `Origin 不在白名单内：${origin}` })
+    if (!allowed.includes(normalizeOrigin(origin))) {
+      // 把双方的值都列出来：只说"不在白名单内"会让人对着看似一样的两个
+      // 字符串排查半天，差别往往是协议、端口或大小写
+      return res.status(403).json({
+        error: `Origin 不在白名单内。收到：${origin}；当前白名单：${allowed.join('、') || '(空)'}。` +
+               '请检查 config.json 的 allowedOrigins，注意协议（http/https）与端口必须完全一致，改完需重启服务。'
+      })
     }
     next()
   }

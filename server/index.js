@@ -70,7 +70,11 @@ async function main () {
   }
   if ((cfg.allowedOrigins ?? []).length === 0) {
     console.warn('⚠️  allowedOrigins 为空，CSRF 的 Origin 校验已跳过（仅依赖 Cookie 的 SameSite=Strict）')
+  } else {
+    // 打印出来，方便确认改动确实被加载了——配置只在启动时读取
+    console.log(`[auth] Origin 白名单：${cfg.allowedOrigins.join('、')}`)
   }
+  console.log(`[auth] trust proxy = ${cfg.trustProxy}`)
 
   try {
     await gpu.start()
