@@ -44,7 +44,14 @@ export class NvidiaSmiSource extends EventEmitter {
     this.buffer = ''
     this.pending = []         // 当前轮次已解析的行
     this.processes = []
+    this.lastDevices = []
+
+    // 先乐观假定可用。判定推迟到 apps 首次轮询完成之后——
+    // 两条通道是并发启动的，显存流通常先返回，此时进程列表还是空的，
+    // 若在那一刻就下结论，任何卡上有占用的机器都会被误判成"进程列表不可用"
     this.processesAvailable = true
+    this.appsPolledOnce = false
+    this.appsQueryOk = null   // null=未轮询, true=查询成功, false=查询失败
   }
 
   async start () {
@@ -124,6 +131,7 @@ export class NvidiaSmiSource extends EventEmitter {
       if (this.pending.length >= this.staticInfo.length) {
         const devices = this.pending.sort((a, b) => a.index - b.index)
         this.pending = []
+        this.lastDevices = devices
         this.restartDelay = 1000 // 成功收到数据，重置退避
         this.emit('update', {
           timestamp: Date.now(),
@@ -153,27 +161,56 @@ export class NvidiaSmiSource extends EventEmitter {
             usedMemoryMb: parseNumeric(mem)
           }
         }).filter(p => !Number.isNaN(p.pid) && !Number.isNaN(p.usedMemoryMb))
+        this.appsQueryOk = true
       } catch {
         this.processes = []
-        this.processesAvailable = false
+        this.appsQueryOk = false
       }
+      this.appsPolledOnce = true
+      this.evaluateProcessAvailability()
       this.appsTimer = setTimeout(poll, this.cfg.gpu.appsIntervalMs)
     }
     poll()
   }
 
   /**
-   * WSL2 的 GPU 半虚拟化不暴露进程列表：查询成功但永远返回空。
-   * 用「卡上明显有显存被占，进程列表却是空的」来识别这种降级，
-   * 避免调度器把"查不到进程"误读成"卡是干净的"。
+   * 判断进程列表是否真的取不到。
+   *
+   * 在 apps 轮询结束后评估，而不是在显存数据到达时——两条通道并发启动，
+   * 显存流通常先返回，那时进程列表必然还是空的。
+   *
+   * 判定必须可逆：曾经因为一次超时降级，不该让后续所有成功查询都失效。
    */
-  updateProcessAvailability (devices) {
-    if (!this.processesAvailable) return
-    const someoneUsingMemory = devices.some(d => d.memUsedMb > 500)
-    if (someoneUsingMemory && this.processes.length === 0) {
-      this.processesAvailable = false
-      this.emit('warn', 'GPU 进程列表不可用（WSL2 等环境的已知限制），已降级为仅显示显存')
+  evaluateProcessAvailability () {
+    if (!this.appsPolledOnce) return
+
+    // 查询本身失败（命令不支持、驱动繁忙超时）——确实拿不到
+    if (this.appsQueryOk === false) {
+      this.setProcessesAvailable(false, 'nvidia-smi 进程查询失败，暂时只能显示显存')
+      return
     }
+
+    // 能列出进程，一切正常
+    if (this.processes.length > 0) {
+      this.setProcessesAvailable(true)
+      return
+    }
+
+    // 查询成功但为空：可能真的没进程，也可能是环境限制（WSL2 的 GPU
+    // 半虚拟化不暴露进程列表，表现就是永远返回空）。只有当卡上明显有
+    // 显存被占用时，才能断定是后者——否则空卡会被误判。
+    const someoneUsingMemory = this.lastDevices.some(d => d.memUsedMb > 500)
+    if (someoneUsingMemory) {
+      this.setProcessesAvailable(false, 'GPU 进程列表不可用（WSL2 等环境的已知限制），已降级为仅显示显存')
+    }
+    // 卡是空的又查不到进程，属于正常情况，维持现状
+  }
+
+  setProcessesAvailable (available, message = null) {
+    if (this.processesAvailable === available) return
+    this.processesAvailable = available
+    if (available) this.emit('warn', 'GPU 进程列表已恢复')
+    else if (message) this.emit('warn', message)
   }
 
   stop () {

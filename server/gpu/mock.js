@@ -110,8 +110,6 @@ export class MockSource extends EventEmitter {
     this.allocations.delete(pgid)
   }
 
-  updateProcessAvailability () { /* mock 始终提供进程列表 */ }
-
   stop () {
     this.stopped = true
     if (this.timer) clearTimeout(this.timer)

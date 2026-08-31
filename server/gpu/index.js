@@ -21,7 +21,6 @@ export class GpuMonitor extends EventEmitter {
       : new NvidiaSmiSource(cfg)
 
     this.source.on('update', snap => {
-      this.source.updateProcessAvailability?.(snap.devices)
       this.snapshot = snap
       this.lastUpdate = Date.now()
       this.emit('update', snap)
