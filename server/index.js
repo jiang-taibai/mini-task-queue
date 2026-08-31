@@ -44,13 +44,16 @@ app.use('/api', (req, res) => res.status(404).json({ error: '接口不存在' })
 // 前端构建产物由后端直接托管：单端口单进程，不用配反向代理也不用处理跨域
 const publicDir = path.join(ROOT, 'server', 'public')
 if (fs.existsSync(publicDir)) {
-  app.use(express.static(publicDir, { index: false }))
-  // Express 5 移除了裸 '*' 通配符，命名通配符写作 '/*splat'
-  app.get('/*splat', (req, res) => {
+  app.use(express.static(publicDir))
+  // SPA 回退用无路径中间件而非 app.get('/*splat')：
+  // Express 5 的命名通配符不匹配根路径 '/'，直接访问首页会掉进 404
+  app.use((req, res, next) => {
+    if (req.method !== 'GET') return next()
     res.sendFile(path.join(publicDir, 'index.html'))
   })
 } else {
-  app.get('/*splat', (req, res) => {
+  app.use((req, res, next) => {
+    if (req.method !== 'GET') return next()
     res.status(503).type('text/plain; charset=utf-8')
       .send('前端尚未构建。请先运行：npm run build')
   })

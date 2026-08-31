@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 
 // CSI 序列 + OSC 序列 + 双字符转义
 const ANSI_RE = /\x1B(?:\[[0-?]*[ -\/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\)|[@-Z\\-_])/g
@@ -90,10 +91,37 @@ export async function readLogSlice (filePath, { offset = null, maxBytes = 200 * 
  * 用轮询 stat 而不是 fs.watch：watch 在网络文件系统和部分容器挂载上不触发，
  * 而这个功能一旦静默失效，用户会以为任务卡住了。
  */
+async function readRawBytes (filePath, offset, maxBytes) {
+  const fh = await fsp.open(filePath, 'r')
+  try {
+    const buf = Buffer.alloc(maxBytes)
+    const { bytesRead } = await fh.read(buf, 0, maxBytes, offset)
+    return buf.subarray(0, bytesRead)
+  } finally {
+    await fh.close()
+  }
+}
+
+/**
+ * 增量跟随日志文件。
+ *
+ * 用轮询 stat 而不是 fs.watch：watch 在网络文件系统和部分容器挂载上不触发，
+ * 而这个功能一旦静默失效，用户会以为任务卡住了。
+ *
+ * 关键在于区分「完整行」和「未完成行」。进度条整段都没有换行，若把每个增量
+ * 片段各自清洗后直接追加，`\r` 的覆盖语义就跨不过片段边界，结果是
+ * "Epoch 1: 70%Epoch 1: 71%..." 越拼越长。所以未完成的那一行单独送出，
+ * 由前端替换而非追加——这才是终端里原地刷新的效果。
+ */
 export function followLog (filePath, { fromOffset = 0, intervalMs = 500, onData, onError }) {
   let offset = fromOffset
+  let carry = ''      // 上一轮尚未遇到换行的残行
   let stopped = false
   let timer = null
+
+  // 中文日志里一个字符占 3 字节，很容易被分块边界劈开。
+  // StringDecoder 会把不完整的字节序列留到下一块，避免乱码。
+  let decoder = new StringDecoder('utf8')
 
   const poll = async () => {
     if (stopped) return
@@ -101,12 +129,30 @@ export function followLog (filePath, { fromOffset = 0, intervalMs = 500, onData,
       const st = await statLog(filePath)
       if (st.exists) {
         // 文件变小 = 被截断或重建，从头开始读
-        if (st.size < offset) offset = 0
+        if (st.size < offset) {
+          offset = 0
+          carry = ''
+          decoder = new StringDecoder('utf8')
+        }
 
         if (st.size > offset) {
-          const slice = await readLogSlice(filePath, { offset, maxBytes: 512 * 1024 })
-          offset = slice.end
-          if (slice.content) onData({ content: slice.content, offset, size: st.size })
+          const maxBytes = Math.min(512 * 1024, st.size - offset)
+          const bytes = await readRawBytes(filePath, offset, maxBytes)
+          // 按实际字节数推进，不能用解码后的字符串长度
+          offset += bytes.length
+
+          const combined = carry + decoder.write(bytes)
+          const lastBreak = combined.lastIndexOf('\n')
+
+          const completed = lastBreak >= 0 ? combined.slice(0, lastBreak + 1) : ''
+          carry = lastBreak >= 0 ? combined.slice(lastBreak + 1) : combined
+
+          onData({
+            content: completed ? sanitize(completed) : '',
+            partial: carry ? sanitize(carry) : '',
+            offset,
+            size: st.size
+          })
         }
       }
     } catch (err) {

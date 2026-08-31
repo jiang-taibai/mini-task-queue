@@ -1,0 +1,138 @@
+<script setup>
+import { computed } from 'vue'
+import { useRouter } from 'vue-router'
+import { formatMb, formatDuration, formatTime, STATUS_META } from '../api.js'
+
+const props = defineProps({
+  task: { type: Object, required: true },
+  draggable: { type: Boolean, default: false },
+  now: { type: Number, default: () => Date.now() }
+})
+const emit = defineEmits(['stop', 'edit', 'clone', 'remove', 'requeue'])
+
+const router = useRouter()
+
+const meta = computed(() => STATUS_META[props.task.status] ?? { label: props.task.status, type: 'default' })
+
+const elapsed = computed(() => {
+  const t = props.task
+  if (t.status === 'running' && t.startedAt) return props.now - t.startedAt
+  if (t.startedAt && t.finishedAt) return t.finishedAt - t.startedAt
+  return null
+})
+
+// 队列里的等待时长要显眼：严格门控下一个排不上的任务会挡住所有人，
+// 你需要一眼看出该不该插手
+const waiting = computed(() => {
+  const t = props.task
+  if (t.status !== 'pending' && t.status !== 'blocked') return null
+  return props.now - t.createdAt
+})
+
+const isActive = computed(() => ['running', 'pending', 'blocked'].includes(props.task.status))
+</script>
+
+<template>
+  <n-card size="small" class="task-card" :class="{ 'is-running': task.status === 'running' }">
+    <div class="row">
+      <div v-if="draggable" class="drag-handle" title="拖动以调整顺序">⋮⋮</div>
+
+      <n-tag :type="meta.type" size="small" :bordered="false">{{ meta.label }}</n-tag>
+
+      <a class="name" @click="router.push(`/task/${task.id}`)">
+        <n-text depth="3">#{{ task.id }}</n-text>
+        {{ task.name }}
+      </a>
+
+      <n-space :size="14" align="center" class="facts">
+        <n-text v-if="task.gpuIndex !== null && task.status === 'running'" depth="2">
+          GPU {{ task.gpuIndex }}
+        </n-text>
+        <n-text depth="3">需 {{ formatMb(task.memRequiredMb) }}</n-text>
+        <n-text v-if="elapsed !== null" depth="3">
+          {{ task.status === 'running' ? '已运行' : '耗时' }} {{ formatDuration(elapsed) }}
+        </n-text>
+        <n-text v-if="waiting !== null" depth="3">已等待 {{ formatDuration(waiting) }}</n-text>
+        <n-text v-if="task.attemptCount > 1" depth="3">第 {{ task.attemptCount }} 次尝试</n-text>
+      </n-space>
+
+      <n-space :size="4" class="actions">
+        <n-button v-if="isActive" size="tiny" quaternary @click="emit('stop', task)">
+          {{ task.status === 'running' ? '停止' : '取消' }}
+        </n-button>
+        <n-button v-if="!isActive" size="tiny" quaternary @click="emit('requeue', task)">
+          重新排队
+        </n-button>
+        <n-button v-if="task.status !== 'running'" size="tiny" quaternary @click="emit('edit', task)">
+          编辑
+        </n-button>
+        <n-button size="tiny" quaternary @click="emit('clone', task)">克隆</n-button>
+        <n-button size="tiny" quaternary @click="router.push(`/task/${task.id}`)">详情</n-button>
+        <n-button
+          v-if="task.status !== 'running'"
+          size="tiny"
+          quaternary
+          type="error"
+          @click="emit('remove', task)"
+        >
+          删除
+        </n-button>
+      </n-space>
+    </div>
+
+    <div v-if="task.failReason" class="reason">
+      <n-text :depth="task.status === 'pending' ? 3 : 2" style="font-size: 12px;">
+        {{ task.failReason }}
+      </n-text>
+    </div>
+    <div v-if="task.status === 'blocked' && task.dependsOn.length" class="reason">
+      <n-text depth="3" style="font-size: 12px;">
+        等待前置任务 {{ task.dependsOn.map(id => '#' + id).join('、') }} 完成
+      </n-text>
+    </div>
+  </n-card>
+</template>
+
+<style scoped>
+.task-card {
+  margin-bottom: 8px;
+}
+.is-running {
+  border-left: 3px solid var(--n-color-target, #63e2b7);
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.drag-handle {
+  cursor: grab;
+  opacity: 0.4;
+  font-size: 14px;
+  letter-spacing: -2px;
+  user-select: none;
+}
+.drag-handle:active {
+  cursor: grabbing;
+}
+.name {
+  font-weight: 500;
+  cursor: pointer;
+  flex: 1;
+  min-width: 140px;
+}
+.name:hover {
+  text-decoration: underline;
+}
+.facts {
+  font-size: 12px;
+}
+.actions {
+  margin-left: auto;
+}
+.reason {
+  margin-top: 6px;
+  padding-left: 4px;
+}
+</style>

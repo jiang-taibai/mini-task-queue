@@ -17,3 +17,6 @@ server.log
 .vscode/
 .idea/
 *.swp
+
+# 浏览器验证产物
+.playwright-mcp/

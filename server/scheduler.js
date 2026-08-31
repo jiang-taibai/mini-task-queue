@@ -501,6 +501,32 @@ export class Scheduler extends EventEmitter {
     this.emit('change', { taskId })
   }
 
+  /**
+   * 给 GPU 进程列表标注归属：哪些是我们派出去的任务，哪些是别人的。
+   *
+   * 满载环境下这个信息很实用——一眼能看出正在跟谁抢卡，是同事的进程
+   * 还是自己某个忘了停的任务。匹配仍然走进程组：nvidia-smi 报的是
+   * python 进程，而我们记录的是 bash wrapper。
+   */
+  annotateState (gpuState) {
+    const byPgid = new Map()
+    for (const t of this.getRunning()) {
+      if (t.pgid) byPgid.set(t.pgid, t)
+    }
+
+    return {
+      ...gpuState,
+      processes: gpuState.processes.map(p => {
+        const pgid = getPgid(p.pid)
+        const task = pgid === null ? null : byPgid.get(pgid)
+        return { ...p, taskId: task?.id ?? null, taskName: task?.name ?? null }
+      }),
+      reserved: Object.fromEntries(
+        gpuState.devices.map(d => [d.index, this.reservedOn(d.index)])
+      )
+    }
+  }
+
   /** 队列被谁挡住了——UI 顶部的阻塞提示条用它 */
   getBlockingInfo () {
     const queue = this.getQueue()

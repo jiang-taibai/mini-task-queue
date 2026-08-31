@@ -47,7 +47,7 @@ export function createSystemRouter ({ cfg, sessions, limiter, gpu, scheduler, re
   })
 
   router.get('/gpu', requireAuth, (req, res) => {
-    res.json(gpu.getState())
+    res.json(scheduler.annotateState(gpu.getState()))
   })
 
   router.get('/config', requireAuth, (req, res) => {

@@ -41,13 +41,13 @@ export function createEventsRouter ({ db, scheduler, gpu }) {
   scheduler.on('log', message => broadcast('log', { at: Date.now(), message }))
 
   gpu.on('update', () => {
-    if (clients.size > 0) broadcast('gpu', gpu.getState())
+    if (clients.size > 0) broadcast('gpu', scheduler.annotateState(gpu.getState()))
   })
   gpu.on('warn', entry => broadcast('warn', entry))
 
   // GPU 失联时不会再有 update 事件，靠这个心跳把"已失联"状态推给前端
   setInterval(() => {
-    if (clients.size > 0 && gpu.isStale()) broadcast('gpu', gpu.getState())
+    if (clients.size > 0 && gpu.isStale()) broadcast('gpu', scheduler.annotateState(gpu.getState()))
   }, 2000).unref()
 
   router.get('/', (req, res) => {
@@ -62,7 +62,7 @@ export function createEventsRouter ({ db, scheduler, gpu }) {
     clients.add(res)
 
     // 立刻推一份全量，避免前端在首次变更前一直空着
-    res.write(`event: gpu\ndata: ${JSON.stringify(gpu.getState())}\n\n`)
+    res.write(`event: gpu\ndata: ${JSON.stringify(scheduler.annotateState(gpu.getState()))}\n\n`)
     res.write(`event: tasks\ndata: ${JSON.stringify(snapshotTasks())}\n\n`)
 
     const heartbeat = setInterval(() => {
