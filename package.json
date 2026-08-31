@@ -1,0 +1,29 @@
+{
+  "name": "mini-task-queue",
+  "version": "1.0.0",
+  "description": "GPU 任务队列：监控显存，条件满足时自动分配空闲卡并后台执行实验",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "setup": "node server/setup.js",
+    "start": "node server/index.js",
+    "dev": "concurrently -n server,web -c blue,green \"node --watch server/index.js\" \"vite\"",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "cookie-parser": "^1.4.7",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.8",
+    "concurrently": "^10.0.5",
+    "naive-ui": "^2.45.3",
+    "vite": "^8.2.2",
+    "vue": "^3.5.42",
+    "vue-draggable-plus": "^0.6.1",
+    "vue-router": "^5.3.0"
+  }
+}
