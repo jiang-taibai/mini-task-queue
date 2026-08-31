@@ -50,6 +50,14 @@ export class GpuMonitor extends EventEmitter {
     return this.snapshot?.devices ?? []
   }
 
+  /** 卡数。首帧数据到达前退回数据源的静态信息，避免启动日志显示为未知 */
+  getDeviceCount () {
+    return this.snapshot?.devices.length
+      ?? this.source.staticInfo?.length
+      ?? this.source.devices?.length
+      ?? 0
+  }
+
   getProcesses () {
     return this.snapshot?.processes ?? []
   }

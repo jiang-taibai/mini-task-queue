@@ -74,7 +74,7 @@ async function main () {
 
   try {
     await gpu.start()
-    console.log(`[gpu] 数据源：${cfg.gpu.source}，检测到 ${gpu.getDevices().length || '?'} 张卡`)
+    console.log(`[gpu] 数据源：${cfg.gpu.source}，检测到 ${gpu.getDeviceCount()} 张卡`)
   } catch (err) {
     // 起不来也要让服务活着：GPU 数据保持"失联"状态，调度器因此不会派出任何任务，
     // 界面上能看到明确的错误，比进程直接退出好排查
