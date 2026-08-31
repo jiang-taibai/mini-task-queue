@@ -28,6 +28,8 @@ export class MockSource extends EventEmitter {
     this.externalUsage = new Map()  // gpuIndex -> 外部进程占用 MB
     this.allocations = new Map()    // pgid -> { gpuIndex, memMb, startedAt }
     this.fluctuate = false
+    // 让任务故意占用相邻的卡，用来验证「分流被绕过」的检测能否抓到
+    this.simulateDrift = false
   }
 
   async start () {
@@ -93,7 +95,15 @@ export class MockSource extends EventEmitter {
   }
 
   noteTaskStart (pgid, gpuIndex, memMb) {
-    this.allocations.set(pgid, { gpuIndex, memMb, startedAt: Date.now() })
+    // 开启 drift 时把占用记到相邻的卡上，模拟 .env 覆盖了 CUDA_VISIBLE_DEVICES 的情形
+    const effective = this.simulateDrift
+      ? (gpuIndex + 1) % this.devices.length
+      : gpuIndex
+    this.allocations.set(pgid, { gpuIndex: effective, memMb, startedAt: Date.now() })
+  }
+
+  setDrift (on) {
+    this.simulateDrift = !!on
   }
 
   noteTaskEnd (pgid) {

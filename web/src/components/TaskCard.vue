@@ -30,6 +30,14 @@ const waiting = computed(() => {
 })
 
 const isActive = computed(() => ['running', 'pending', 'blocked'].includes(props.task.status))
+
+// 实际占用的卡与分配的卡不符 = 分流被绕过（多半是 .env 覆盖了 CUDA_VISIBLE_DEVICES）
+const gpuDrift = computed(() => {
+  const t = props.task
+  if (!t.actualGpus?.length || t.gpuIndex === null) return null
+  if (t.actualGpus.includes(t.gpuIndex)) return null
+  return t.actualGpus.join('、')
+})
 </script>
 
 <template>
@@ -78,6 +86,13 @@ const isActive = computed(() => ['running', 'pending', 'blocked'].includes(props
           删除
         </n-button>
       </n-space>
+    </div>
+
+    <div v-if="gpuDrift" class="reason">
+      <n-text type="error" style="font-size: 12px;">
+        ⚠ 分配到 GPU {{ task.gpuIndex }}，实际却运行在 GPU {{ gpuDrift }} 上——
+        分流被绕过，请检查 .env 或代码里的卡号设置
+      </n-text>
     </div>
 
     <div v-if="task.failReason" class="reason">

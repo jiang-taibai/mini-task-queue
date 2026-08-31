@@ -422,18 +422,59 @@ export class Scheduler extends EventEmitter {
     for (const p of processes) {
       const pgid = getPgid(p.pid)
       if (pgid === null) continue
-      byPgid.set(pgid, (byPgid.get(pgid) ?? 0) + p.usedMemoryMb)
+      const entry = byPgid.get(pgid) ?? { usedMb: 0, gpus: new Set() }
+      entry.usedMb += p.usedMemoryMb
+      if (p.gpuIndex !== null) entry.gpus.add(p.gpuIndex)
+      byPgid.set(pgid, entry)
     }
 
     for (const task of running) {
-      const used = byPgid.get(task.pgid)
-      if (used === undefined) continue
-      if (task.peakMemMb === null || used > task.peakMemMb) {
-        this.db.prepare('UPDATE tasks SET peak_mem_mb = ? WHERE id = ?').run(used, task.id)
+      const entry = byPgid.get(task.pgid)
+      if (entry === undefined) continue
+
+      if (task.peakMemMb === null || entry.usedMb > task.peakMemMb) {
+        this.db.prepare('UPDATE tasks SET peak_mem_mb = ? WHERE id = ?').run(entry.usedMb, task.id)
         this.db.prepare('UPDATE attempts SET peak_mem_mb = ? WHERE task_id = ? AND attempt_no = ?')
-          .run(used, task.id, task.attemptCount)
+          .run(entry.usedMb, task.id, task.attemptCount)
       }
+
+      this.checkGpuDrift(task, entry.gpus)
     }
+  }
+
+  /**
+   * 检测任务是否跑在了调度器分配之外的卡上。
+   *
+   * 分流靠 CUDA_VISIBLE_DEVICES，但这个变量可能被绕过——最常见的是项目里的
+   * .env 用覆盖方式加载（`load_dotenv(override=True)`、`source .env`、direnv），
+   * 或者代码里硬编码了 cuda:1 / torch.cuda.set_device()。
+   *
+   * 这类错位两边都不报错：任务在别的卡上跑，账本却按分配的卡记账，
+   * 于是那张卡会被超派，症状是毫无来由的 OOM。这里直接拿 nvidia-smi
+   * 观测到的实际卡号对账，不管被绕过的原因是什么都能抓到。
+   */
+  checkGpuDrift (task, observedGpus) {
+    if (observedGpus.size === 0) return
+
+    const actual = [...observedGpus].sort((a, b) => a - b)
+    const previous = task.actualGpus
+    // 只在首次发现或结果变化时写库和告警，避免每秒重复刷屏
+    if (previous && previous.length === actual.length && previous.every((g, i) => g === actual[i])) return
+
+    this.db.prepare('UPDATE tasks SET actual_gpus = ? WHERE id = ?')
+      .run(JSON.stringify(actual), task.id)
+
+    if (!observedGpus.has(task.gpuIndex)) {
+      const message =
+        `任务 #${task.id}「${task.name}」被分配到 GPU ${task.gpuIndex}，` +
+        `但实际运行在 GPU ${actual.join('、')} 上。` +
+        `分流已被绕过——请检查工作目录下的 .env 是否设置了 CUDA_VISIBLE_DEVICES，` +
+        `或代码里是否硬编码了卡号。显存账本对这张卡的记账已不可信。`
+      this.emit('log', `⚠ ${message}`)
+      // 同时落服务端日志：你未必开着浏览器，而这个问题会一直污染账本
+      console.warn('[scheduler] 分流漂移:', message)
+    }
+    this.emitChange(task.id)
   }
 
   // —— 重启后认领 ——

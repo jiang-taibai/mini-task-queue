@@ -75,6 +75,11 @@ export function createSystemRouter ({ cfg, sessions, limiter, gpu, scheduler, re
       res.json({ ok: true, state: gpu.getState() })
     })
 
+    router.post('/mock/drift', requireAuth, (req, res) => {
+      gpu.mock.setDrift(!!req.body?.enabled)
+      res.json({ ok: true, drift: !!req.body?.enabled })
+    })
+
     router.post('/mock/fluctuate', requireAuth, (req, res) => {
       gpu.mock.setFluctuate(!!req.body?.enabled)
       res.json({ ok: true, fluctuate: !!req.body?.enabled })

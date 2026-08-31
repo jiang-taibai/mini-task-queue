@@ -1,5 +1,6 @@
 import express from 'express'
 import fs from 'node:fs'
+import path from 'node:path'
 import { rowToTask, rowToAttempt } from '../db.js'
 import { readLogSlice, statLog, logPathFor, removeTaskLogs, followLog } from '../logs.js'
 
@@ -108,12 +109,45 @@ export function createTasksRouter ({ db, scheduler, gpu, cfg }) {
       warnings.push('命令中出现了 cuda:1 之类的硬编码卡号。分流靠 CUDA_VISIBLE_DEVICES 实现，设定后代码里应统一使用 cuda:0')
     }
 
+    warnings.push(...checkDotenv(cwd))
+
     return {
       errors,
       warnings,
       value: { name, cwd, command, memRequiredMb, allowedGpus, env, dependsOn, timeoutSeconds }
     }
   }
+
+  /**
+   * 提交时就检查工作目录下的 .env 有没有写 CUDA_VISIBLE_DEVICES。
+   *
+   * 它是否真会盖掉调度器的设置取决于加载方式——`load_dotenv()` 默认不覆盖
+   * 已有变量（安全），但 `override=True`、`source .env`、direnv 都会覆盖。
+   * 与其等任务跑到错误的卡上再靠漂移检测发现，不如在这里提醒一句。
+   */
+  function checkDotenv (cwd) {
+    if (!cwd) return []
+    try {
+      const envPath = path.join(cwd, '.env')
+      const stat = fs.statSync(envPath)
+      if (!stat.isFile() || stat.size > 256 * 1024) return []
+
+      const content = fs.readFileSync(envPath, 'utf8')
+      const hit = content.split('\n').find(line =>
+        /^\s*(export\s+)?CUDA_VISIBLE_DEVICES\s*=/.test(line)
+      )
+      if (!hit) return []
+
+      return [
+        `工作目录下的 .env 里设置了 CUDA_VISIBLE_DEVICES（${hit.trim()}）。` +
+        '若你的代码用 load_dotenv(override=True)、source .env 或 direnv 加载，它会盖掉调度器分配的卡号，' +
+        '导致任务跑错卡而账本记错账。load_dotenv() 默认不覆盖，则不受影响。'
+      ]
+    } catch {
+      return []
+    }
+  }
+
 
   router.get('/', (req, res) => {
     res.json({

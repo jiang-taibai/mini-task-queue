@@ -33,6 +33,13 @@ const elapsed = computed(() => {
   return (t.finishedAt ?? now.value) - t.startedAt
 })
 
+const gpuDrift = computed(() => {
+  const t = task.value
+  if (!t?.actualGpus?.length || t.gpuIndex === null) return null
+  if (t.actualGpus.includes(t.gpuIndex)) return null
+  return t.actualGpus.join('、')
+})
+
 const attemptOptions = computed(() =>
   (detail.value?.attempts ?? []).map(a => ({
     label: `第 ${a.attemptNo} 次 · ${outcomeLabel(a.outcome)} · ${formatBytes(a.logSize)}`,
@@ -154,6 +161,14 @@ const envEntries = computed(() => Object.entries(task.value?.env ?? {}))
     <n-layout-content class="content">
       <n-spin :show="loading">
         <template v-if="task">
+          <n-alert v-if="gpuDrift" type="error" title="分流被绕过" style="margin-bottom: 16px;">
+            调度器把它分配到 <strong>GPU {{ task.gpuIndex }}</strong>，但 nvidia-smi 观测到它实际运行在
+            <strong>GPU {{ gpuDrift }}</strong> 上。
+            常见原因：工作目录下的 .env 设置了 CUDA_VISIBLE_DEVICES 且以覆盖方式加载
+            （<n-text code>load_dotenv(override=True)</n-text>、<n-text code>source .env</n-text>、direnv），
+            或代码里硬编码了卡号。此时显存账本对这两张卡的记账都已不可信。
+          </n-alert>
+
           <n-alert v-if="task.failReason" :type="task.status === 'failed' ? 'error' : 'warning'" style="margin-bottom: 16px;">
             {{ task.failReason }}
           </n-alert>

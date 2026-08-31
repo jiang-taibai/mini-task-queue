@@ -48,7 +48,10 @@ function migrate (db) {
 
       exit_code       INTEGER,
       fail_reason     TEXT,
-      peak_mem_mb     INTEGER
+      peak_mem_mb     INTEGER,
+      -- 实际观测到的占用卡号（JSON 数组）。与 gpu_index 不符即说明分流被绕过，
+      -- 常见原因是 .env 里写了 CUDA_VISIBLE_DEVICES 且以覆盖方式加载
+      actual_gpus     TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -71,6 +74,16 @@ function migrate (db) {
 
     CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id);
   `)
+
+  // CREATE TABLE IF NOT EXISTS 不会给已有的库补列，增量字段走这里
+  addColumnIfMissing(db, 'tasks', 'actual_gpus', 'TEXT')
+}
+
+function addColumnIfMissing (db, table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all()
+  if (!columns.some(c => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+  }
 }
 
 /** 数据库行 -> API 对象：把 JSON 字段解开，字段名转驼峰 */
@@ -99,7 +112,8 @@ export function rowToTask (row) {
     finishedAt: row.finished_at,
     exitCode: row.exit_code,
     failReason: row.fail_reason,
-    peakMemMb: row.peak_mem_mb
+    peakMemMb: row.peak_mem_mb,
+    actualGpus: row.actual_gpus ? JSON.parse(row.actual_gpus) : null
   }
 }
 
