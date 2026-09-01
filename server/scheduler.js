@@ -171,14 +171,16 @@ export class Scheduler extends EventEmitter {
       status = 'succeeded'
       attemptOutcome = 'succeeded'
     } else if (this.looksLikeLostRace(task, durationMs)) {
-      // 没抢过别人：启动后很快就因显存不足倒下
-      if (task.attemptCount < this.cfg.scheduler.maxRetries) {
-        this.requeueTask(task, `第 ${task.attemptCount} 次抢卡失败（显存不足），已重新排队`)
+      // 没抢过别人：启动后很快就因显存不足倒下。
+      // 用 retryCount 而不是 attemptCount：后者跨轮累加，手动重排过的任务
+      // 一进来就超预算，等于再也不会自动重试
+      if (task.retryCount < this.cfg.scheduler.maxRetries) {
+        this.requeueTask(task, `第 ${task.retryCount} 次抢卡失败（显存不足），已重新排队`)
         return
       }
       status = 'failed'
       attemptOutcome = 'failed'
-      failReason = `连续 ${task.attemptCount} 次因显存不足失败，请检查显存声明是否偏小`
+      failReason = `连续 ${task.retryCount} 次因显存不足失败，请检查显存声明是否偏小`
     } else {
       status = 'failed'
       attemptOutcome = attemptOutcome ?? 'failed'
@@ -465,7 +467,9 @@ export class Scheduler extends EventEmitter {
   }
 
   launchTask (task, gpuIndices) {
+    // 编号单调递增，跨轮不复位：它决定写哪个 attempt-<n>.log
     const attemptNo = task.attemptCount + 1
+    const retryCount = task.retryCount + 1
     const now = Date.now()
     const expiresAt = now + this.cfg.scheduler.warmupSeconds * 1000
     const indicesJson = JSON.stringify(gpuIndices)
@@ -485,9 +489,10 @@ export class Scheduler extends EventEmitter {
         this.db.prepare(`
           UPDATE tasks
           SET status = 'running', gpu_index = ?, gpu_indices = ?, pid = ?, pgid = ?, proc_starttime = ?,
-              started_at = ?, attempt_count = ?, finished_at = NULL, exit_code = NULL, fail_reason = NULL
+              started_at = ?, attempt_count = ?, retry_count = ?,
+              finished_at = NULL, exit_code = NULL, fail_reason = NULL
           WHERE id = ?
-        `).run(gpuIndices[0], indicesJson, pid, pgid, procStarttime, now, attemptNo, task.id)
+        `).run(gpuIndices[0], indicesJson, pid, pgid, procStarttime, now, attemptNo, retryCount, task.id)
 
         this.db.prepare(`
           INSERT INTO attempts (task_id, attempt_no, gpu_index, gpu_indices, pid, pgid, started_at, log_path)

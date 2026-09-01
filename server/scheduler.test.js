@@ -283,6 +283,23 @@ test('单卡任务行为不变：一张卡、一条预留', async () => {
   assert.deepEqual(scheduler.getTask(id).gpuIndices, [0])
 })
 
+test('重排后的一轮沿用新编号写日志，不覆盖上一轮', async () => {
+  const { db, scheduler, runner, pump } = setup()
+  const id = addTask(db, [8192])
+  // 「重新排队」之后的状态：跑过 3 次，重试预算已清空
+  db.prepare('UPDATE tasks SET attempt_count = 3, retry_count = 0 WHERE id = ?').run(id)
+
+  pump()
+  scheduler.tick()
+  await settle()
+
+  assert.equal(
+    runner.launched[0].attemptNo, 4,
+    '从 1 重新开始会写进上一轮的 attempt-1.log，并让 attempts 表出现同号两行'
+  )
+  assert.equal(scheduler.getTask(id).retryCount, 1, '本轮的自动重试预算独立计数')
+})
+
 test('gpu_mems 为空的历史行回退成单卡，不会炸', async () => {
   const { db, scheduler } = setup()
   const info = db.prepare(`

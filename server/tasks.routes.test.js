@@ -189,3 +189,28 @@ test('仍接受旧的 memRequiredMb 单值写法', async () => {
   assert.equal(status, 201)
   assert.deepEqual(body.task.gpuMems, [4096])
 })
+
+test('重新排队只清空重试预算，尝试编号继续往后走', async () => {
+  const { body } = await post({ gpuMems: [1000] })
+  const id = body.task.id
+  db.prepare(`
+    UPDATE tasks SET status = 'failed', attempt_count = 3, retry_count = 3,
+                     gpu_index = 1, gpu_indices = '[1]', exit_code = 1,
+                     fail_reason = '退出码 1', finished_at = 123
+    WHERE id = ?
+  `).run(id)
+
+  const res = await fetch(`${base}/api/tasks/${id}/requeue`, { method: 'POST' })
+  const task = (await res.json()).task
+
+  assert.equal(res.status, 200)
+  assert.equal(task.status, 'pending')
+  assert.equal(task.retryCount, 0, '新一轮该有完整的自动重试预算')
+  assert.equal(
+    task.attemptCount, 3,
+    '归零会让新一轮从 attempt-1.log 重新写，把上一轮的日志和记录覆盖掉'
+  )
+  assert.deepEqual(task.gpuIndices, [], '上一轮的卡号必须清掉，否则界面上它看着还占着卡')
+  assert.equal(task.exitCode, null)
+  assert.equal(task.failReason, null)
+})

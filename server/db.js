@@ -32,7 +32,11 @@ function migrate (db) {
 
       status          TEXT    NOT NULL,  -- blocked|pending|running|succeeded|failed|cancelled
       queue_order     REAL    NOT NULL,
+      -- 单调递增，永不归零：它同时是日志文件名 attempt-<n>.log 的编号，
+      -- 归零会让手动重排后的新一轮覆盖掉上一轮的日志与记录
       attempt_count   INTEGER NOT NULL DEFAULT 0,
+      -- 本轮的自动重试预算（OOM 重排队用），手动「重新排队」时归零
+      retry_count     INTEGER NOT NULL DEFAULT 0,
 
       gpu_index       INTEGER,
       pid             INTEGER,
@@ -92,6 +96,53 @@ function migrate (db) {
   addColumnIfMissing(db, 'attempts', 'peak_mem_per_gpu', 'TEXT')
 
   backfillSlotArrays(db)
+
+  // 手动「重新排队」曾经把 attempt_count 归零，于是第二轮的第 1 次尝试会复用
+  // 第一轮的编号：日志文件 attempt-1.log 被追加写、attempts 表多出一行同号记录、
+  // 而所有 `WHERE attempt_no = ?` 的更新会同时打到两行上，把第一轮的结果覆盖掉。
+  //
+  // 拆成两个计数器：attempt_count 单调递增，只负责标识「第几段日志」；
+  // retry_count 是本轮的自动重试预算，手动重排时归零。
+  if (addColumnIfMissing(db, 'tasks', 'retry_count', 'INTEGER NOT NULL DEFAULT 0')) {
+    // 只在列刚建出来时回填：retry_count 为 0 是手动重排后的正常状态，
+    // 每次启动都跑一遍会把重排过的任务的重试预算又填满
+    db.exec('UPDATE tasks SET retry_count = attempt_count')
+  }
+
+  repairDuplicateAttempts(db)
+}
+
+/**
+ * 收拾上面那个 bug 已经造成的历史数据。
+ *
+ * 同号的两行里，后写入的那行才和磁盘上的日志文件对得上（前一轮的记录早被
+ * 覆盖了），所以保留 id 最大的一行。日志本身是追加写的，两轮内容已经混在
+ * 同一个文件里，这一点无法追溯修复。
+ *
+ * 去重之后把 attempt_count 顶到该任务出现过的最大编号：否则下一次重排会从
+ * 一个已经用过的编号接着写，又撞上老日志文件。running 的任务不能动——
+ * 它的 attempt_count 正被用来定位当前这次尝试的日志和 attempts 行。
+ */
+function repairDuplicateAttempts (db) {
+  db.exec(`
+    DELETE FROM attempts WHERE id NOT IN (
+      SELECT MAX(id) FROM attempts GROUP BY task_id, attempt_no
+    );
+    UPDATE tasks SET attempt_count = (
+      SELECT MAX(attempt_no) FROM attempts WHERE task_id = tasks.id
+    )
+    WHERE status <> 'running'
+      AND attempt_count < (SELECT COALESCE(MAX(attempt_no), 0) FROM attempts WHERE task_id = tasks.id);
+  `)
+
+  // 让这个 bug 从此不可表达。去重刚跑完，正常情况下必定建得起来；
+  // 万一有意料之外的数据，宁可少一层保护也不能让服务起不来——
+  // 那台机器上还挂着正在跑的实验等着被认领。
+  try {
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_attempts_unique ON attempts(task_id, attempt_no)')
+  } catch (err) {
+    console.warn('[db] attempts 唯一索引未能建立，跳过:', err.message)
+  }
 }
 
 /**
@@ -114,11 +165,12 @@ function backfillSlotArrays (db) {
   `)
 }
 
+/** @returns 是否真的加了列——供只该跑一次的回填判断时机 */
 function addColumnIfMissing (db, table, column, definition) {
   const columns = db.prepare(`PRAGMA table_info(${table})`).all()
-  if (!columns.some(c => c.name === column)) {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
-  }
+  if (columns.some(c => c.name === column)) return false
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+  return true
 }
 
 /**
@@ -151,6 +203,7 @@ export function rowToTask (row) {
     status: row.status,
     queueOrder: row.queue_order,
     attemptCount: row.attempt_count,
+    retryCount: row.retry_count ?? 0,
     // 槽位序的物理卡号；未派发时为空数组。gpuIndex 保留为槽位 0
     gpuIndices: parseSlotArray(row.gpu_indices, row.gpu_index, { emptyWhenNull: true }),
     gpuIndex: row.gpu_index,
