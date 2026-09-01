@@ -31,12 +31,22 @@ const waiting = computed(() => {
 
 const isActive = computed(() => ['running', 'pending', 'blocked'].includes(props.task.status))
 
-// 实际占用的卡与分配的卡不符 = 分流被绕过（多半是 .env 覆盖了 CUDA_VISIBLE_DEVICES）
+// 跑到分配集合之外的卡上 = 分流被绕过（多半是 .env 覆盖了 CUDA_VISIBLE_DEVICES）。
+// 只用了分配集合里的一部分不算漂移，那是「声明多了」，后端另有提示。
 const gpuDrift = computed(() => {
   const t = props.task
-  if (!t.actualGpus?.length || t.gpuIndex === null) return null
-  if (t.actualGpus.includes(t.gpuIndex)) return null
-  return t.actualGpus.join('、')
+  if (!t.actualGpus?.length || !t.gpuIndices?.length) return null
+  const strays = t.actualGpus.filter(g => !t.gpuIndices.includes(g))
+  return strays.length ? strays.join('、') : null
+})
+
+const assignedGpus = computed(() => props.task.gpuIndices?.join('、') ?? '')
+
+const memDemand = computed(() => {
+  const mems = props.task.gpuMems ?? [props.task.memRequiredMb]
+  return mems.length === 1
+    ? `需 ${formatMb(mems[0])}`
+    : `需 ${mems.length} 卡 · ${mems.map(formatMb).join(' + ')}`
 })
 </script>
 
@@ -53,10 +63,10 @@ const gpuDrift = computed(() => {
       </a>
 
       <n-space :size="14" align="center" class="facts">
-        <n-text v-if="task.gpuIndex !== null && task.status === 'running'" depth="2">
-          GPU {{ task.gpuIndex }}
+        <n-text v-if="assignedGpus && task.status === 'running'" depth="2">
+          GPU {{ assignedGpus }}
         </n-text>
-        <n-text depth="3">需 {{ formatMb(task.memRequiredMb) }}</n-text>
+        <n-text depth="3">{{ memDemand }}</n-text>
         <n-text v-if="elapsed !== null" depth="3">
           {{ task.status === 'running' ? '已运行' : '耗时' }} {{ formatDuration(elapsed) }}
         </n-text>
@@ -90,7 +100,7 @@ const gpuDrift = computed(() => {
 
     <div v-if="gpuDrift" class="reason">
       <n-text type="error" style="font-size: 12px;">
-        ⚠ 分配到 GPU {{ task.gpuIndex }}，实际却运行在 GPU {{ gpuDrift }} 上——
+        ⚠ 分配到 GPU {{ assignedGpus }}，实际却占用了 GPU {{ gpuDrift }}——
         分流被绕过，请检查 .env 或代码里的卡号设置
       </n-text>
     </div>

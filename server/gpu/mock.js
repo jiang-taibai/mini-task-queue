@@ -9,6 +9,15 @@ import { EventEmitter } from 'node:events'
  *
  * 关键在于它会模拟「任务启动后延迟若干秒才真正吃显存」这个盲区——
  * 预热期和账本正是为这个盲区存在的，不模拟它就等于没测。
+ *
+ * 多卡下还要模拟两件事，它们是本地唯一能触发新失效模式的手段：
+ *
+ * 1. 分卡错开的加载延迟。device_map="auto" 按分片顺序加载，先填满 cuda:0 再溢到
+ *    cuda:1。若两张卡同时吃满，「跨卡求和误删整条预留」那个 bug 永远不会复现。
+ *
+ * 2. collapse 形变。.env 把 CUDA_VISIBLE_DEVICES 覆盖成单卡时，两个槽位的显存
+ *    会全压在第一张卡上——用的卡仍在分配集合里，集合判定抓不到，只有按卡比对
+ *    数值的检测能发现。
  */
 export class MockSource extends EventEmitter {
   constructor (cfg) {
@@ -26,10 +35,14 @@ export class MockSource extends EventEmitter {
     }))
 
     this.externalUsage = new Map()  // gpuIndex -> 外部进程占用 MB
-    this.allocations = new Map()    // pgid -> { gpuIndex, memMb, startedAt }
+    // pgid -> { startedAt, slots: [{ gpuIndex, memMb, appearsAfterMs }] }
+    this.allocations = new Map()
     this.fluctuate = false
-    // 让任务故意占用相邻的卡，用来验证「分流被绕过」的检测能否抓到
-    this.simulateDrift = false
+    // 形变模式，用来验证「分流被绕过」的两类检测：
+    //   off      —— 老老实实按分配的卡占用
+    //   shift    —— 整体挪到相邻卡（跑出分配集合，集合判定该抓到）
+    //   collapse —— 所有槽位塌缩到第一张卡（仍在分配集合内，只有按卡比对能抓到）
+    this.driftMode = 'off'
   }
 
   async start () {
@@ -43,16 +56,18 @@ export class MockSource extends EventEmitter {
 
   snapshot () {
     const now = Date.now()
-    const delay = this.cfg.gpu.mock.allocDelayMs
 
     const usedByUs = new Map()
     const processes = []
 
     for (const [pgid, a] of this.allocations) {
-      // 启动后 delay 毫秒内显存还没被吃掉——这正是账本要覆盖的盲区
-      if (now - a.startedAt < delay) continue
-      usedByUs.set(a.gpuIndex, (usedByUs.get(a.gpuIndex) ?? 0) + a.memMb)
-      processes.push({ gpuIndex: a.gpuIndex, pid: pgid, usedMemoryMb: a.memMb })
+      for (const slot of a.slots) {
+        // 启动后这段时间里显存还没被吃掉——这正是账本要覆盖的盲区。
+        // 逐槽错开，模拟按分片顺序加载。
+        if (now - a.startedAt < slot.appearsAfterMs) continue
+        usedByUs.set(slot.gpuIndex, (usedByUs.get(slot.gpuIndex) ?? 0) + slot.memMb)
+        processes.push({ gpuIndex: slot.gpuIndex, pid: pgid, usedMemoryMb: slot.memMb })
+      }
     }
 
     const devices = this.devices.map(d => {
@@ -94,16 +109,31 @@ export class MockSource extends EventEmitter {
     this.fluctuate = !!on
   }
 
-  noteTaskStart (pgid, gpuIndex, memMb) {
-    // 开启 drift 时把占用记到相邻的卡上，模拟 .env 覆盖了 CUDA_VISIBLE_DEVICES 的情形
-    const effective = this.simulateDrift
-      ? (gpuIndex + 1) % this.devices.length
-      : gpuIndex
-    this.allocations.set(pgid, { gpuIndex: effective, memMb, startedAt: Date.now() })
+  noteTaskStart (pgid, gpuIndices, memPerGpu) {
+    const delay = this.cfg.gpu.mock.allocDelayMs
+
+    const slots = gpuIndices.map((gpuIndex, slot) => ({
+      gpuIndex: this.effectiveGpu(gpuIndices, slot),
+      memMb: memPerGpu[slot],
+      // 槽位 i 的显存在 delay×(i+1) 之后才出现：第一张卡先吃满，后面的卡逐个跟上
+      appearsAfterMs: delay * (slot + 1)
+    }))
+
+    this.allocations.set(pgid, { startedAt: Date.now(), slots })
   }
 
-  setDrift (on) {
-    this.simulateDrift = !!on
+  /** 按当前形变模式决定某个槽位实际落在哪张卡上 */
+  effectiveGpu (gpuIndices, slot) {
+    if (this.driftMode === 'shift') return (gpuIndices[slot] + 1) % this.devices.length
+    if (this.driftMode === 'collapse') return gpuIndices[0]
+    return gpuIndices[slot]
+  }
+
+  setDrift (mode) {
+    // 兼容早先的布尔开关：true 即原来的「挪到相邻卡」
+    if (typeof mode === 'boolean') mode = mode ? 'shift' : 'off'
+    this.driftMode = ['off', 'shift', 'collapse'].includes(mode) ? mode : 'off'
+    return this.driftMode
   }
 
   noteTaskEnd (pgid) {

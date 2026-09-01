@@ -53,6 +53,20 @@ export class Runner {
   }
 
   /**
+   * 进程相关的查询都从这里走，不让调度器直接依赖 /proc。
+   *
+   * 一是职责本来就该归 Runner，二是 /proc 只有 Linux 才有——在 macOS 上写代码时
+   * 调度器的逻辑至少还能被单独测到，否则任何验证都得等部署到那台卡机上。
+   */
+  pgidOf (pid) {
+    return getPgid(pid)
+  }
+
+  isAlive (task) {
+    return isSameProcess(task.pid, task.procStarttime)
+  }
+
+  /**
    * 启动任务。
    *
    * 三个关键点，各自对应一个会咬人的坑：
@@ -68,7 +82,7 @@ export class Runner {
    * 3. 退出码落盘 —— 服务重启后我们不再是这些进程的父进程，wait() 拿不到
    *    退出码。让 wrapper 把 $? 写进文件，认领时才有权威结果可读。
    */
-  async launch (task, gpuIndex, attemptNo) {
+  async launch (task, gpuIndices, attemptNo) {
     const { logsDir } = this.cfg
     await ensureLogDir(logsDir, task.id)
 
@@ -91,7 +105,11 @@ export class Runner {
       ...task.env,
       // 放在最后：用户若在 env 里自己写了 CUDA_VISIBLE_DEVICES，必须由调度器覆盖，
       // 否则分流会静默错位——任务跑到非预期的卡上，而账本还以为它在这张卡
-      CUDA_VISIBLE_DEVICES: String(gpuIndex)
+      //
+      // 顺序即槽位：CUDA_VISIBLE_DEVICES="3,1" 让脚本里的 cuda:0 指向物理 GPU 3、
+      // cuda:1 指向物理 GPU 1。调度器保证第 i 张卡满足 gpuMems[i] 的声明，
+      // 所以这个顺序不能排序、不能去重，必须原样拼。
+      CUDA_VISIBLE_DEVICES: gpuIndices.join(',')
     }
 
     let child
