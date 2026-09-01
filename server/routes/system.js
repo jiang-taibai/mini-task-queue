@@ -75,9 +75,11 @@ export function createSystemRouter ({ cfg, sessions, limiter, gpu, scheduler, re
       res.json({ ok: true, state: gpu.getState() })
     })
 
+    // mode: off | shift（跑出分配集合）| collapse（塌缩到第一张卡）。
+    // 仍接受旧的 enabled 布尔，省得手边的调试脚本全要改。
     router.post('/mock/drift', requireAuth, (req, res) => {
-      gpu.mock.setDrift(!!req.body?.enabled)
-      res.json({ ok: true, drift: !!req.body?.enabled })
+      const mode = req.body?.mode ?? !!req.body?.enabled
+      res.json({ ok: true, drift: gpu.mock.setDrift(mode) })
     })
 
     router.post('/mock/fluctuate', requireAuth, (req, res) => {

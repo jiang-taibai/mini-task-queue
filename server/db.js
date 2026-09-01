@@ -77,6 +77,41 @@ function migrate (db) {
 
   // CREATE TABLE IF NOT EXISTS 不会给已有的库补列，增量字段走这里
   addColumnIfMissing(db, 'tasks', 'actual_gpus', 'TEXT')
+
+  // 多卡支持：显存需求、分配卡号、显存峰值都从标量变成「槽位数组」。
+  //
+  // 旧的标量列一个都不删，每次写入时同步成派生值（需求与峰值取各槽位之和，
+  // gpu_index 取槽位 0）。理由是回退安全：服务就跑在那台带着实验的机器上，
+  // 万一要退回上一个版本，旧代码读不到列会直接起不来，而那些 running 任务
+  // 还等着被 reclaim() 认领。留着标量列，旧版本至少能启动——它会把双卡任务
+  // 误读成「一个 40G 的单卡任务」，语义是错的但不致命。
+  addColumnIfMissing(db, 'tasks', 'gpu_mems', 'TEXT')
+  addColumnIfMissing(db, 'tasks', 'gpu_indices', 'TEXT')
+  addColumnIfMissing(db, 'tasks', 'peak_mem_per_gpu', 'TEXT')
+  addColumnIfMissing(db, 'attempts', 'gpu_indices', 'TEXT')
+  addColumnIfMissing(db, 'attempts', 'peak_mem_per_gpu', 'TEXT')
+
+  backfillSlotArrays(db)
+}
+
+/**
+ * 把历史行的标量值回填成单元素数组。
+ *
+ * 全部带 `IS NULL` 前置条件，因此可以重复执行。源值为 null 的行保持 null——
+ * 没跑过的任务本来就没有卡号和峰值，填成 [null] 只会让下游多一处判空。
+ */
+function backfillSlotArrays (db) {
+  db.exec(`
+    UPDATE tasks SET gpu_mems = '[' || mem_required_mb || ']' WHERE gpu_mems IS NULL;
+    UPDATE tasks SET gpu_indices = '[' || gpu_index || ']'
+      WHERE gpu_indices IS NULL AND gpu_index IS NOT NULL;
+    UPDATE tasks SET peak_mem_per_gpu = '[' || peak_mem_mb || ']'
+      WHERE peak_mem_per_gpu IS NULL AND peak_mem_mb IS NOT NULL;
+    UPDATE attempts SET gpu_indices = '[' || gpu_index || ']'
+      WHERE gpu_indices IS NULL AND gpu_index IS NOT NULL;
+    UPDATE attempts SET peak_mem_per_gpu = '[' || peak_mem_mb || ']'
+      WHERE peak_mem_per_gpu IS NULL AND peak_mem_mb IS NOT NULL;
+  `)
 }
 
 function addColumnIfMissing (db, table, column, definition) {
@@ -84,6 +119,18 @@ function addColumnIfMissing (db, table, column, definition) {
   if (!columns.some(c => c.name === column)) {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
   }
+}
+
+/**
+ * 解出槽位数组，列为空时回退到标量。
+ *
+ * 兜底不是多余的：如果你回退过一次版本，旧代码会写进几行没有数组字段的新任务，
+ * 再切回新版本时这些行的数组列就是 NULL。回退成 [标量] 至少让它们仍是合法的单卡任务。
+ */
+function parseSlotArray (json, fallbackScalar, { emptyWhenNull = false } = {}) {
+  if (json) return JSON.parse(json)
+  if (fallbackScalar === null || fallbackScalar === undefined) return emptyWhenNull ? [] : null
+  return [fallbackScalar]
 }
 
 /** 数据库行 -> API 对象：把 JSON 字段解开，字段名转驼峰 */
@@ -94,6 +141,8 @@ export function rowToTask (row) {
     name: row.name,
     cwd: row.cwd,
     command: row.command,
+    // 槽位数组是真相源；memRequiredMb 是各槽位之和，仅供展示与旧版本回退
+    gpuMems: parseSlotArray(row.gpu_mems, row.mem_required_mb),
     memRequiredMb: row.mem_required_mb,
     allowedGpus: row.allowed_gpus ? JSON.parse(row.allowed_gpus) : null,
     env: JSON.parse(row.env || '{}'),
@@ -102,6 +151,8 @@ export function rowToTask (row) {
     status: row.status,
     queueOrder: row.queue_order,
     attemptCount: row.attempt_count,
+    // 槽位序的物理卡号；未派发时为空数组。gpuIndex 保留为槽位 0
+    gpuIndices: parseSlotArray(row.gpu_indices, row.gpu_index, { emptyWhenNull: true }),
     gpuIndex: row.gpu_index,
     pid: row.pid,
     pgid: row.pgid,
@@ -112,6 +163,8 @@ export function rowToTask (row) {
     finishedAt: row.finished_at,
     exitCode: row.exit_code,
     failReason: row.fail_reason,
+    // 每个槽位在时间轴上各自的最大值；peakMemMb 是它们的和
+    peakMemPerGpu: parseSlotArray(row.peak_mem_per_gpu, row.peak_mem_mb),
     peakMemMb: row.peak_mem_mb,
     actualGpus: row.actual_gpus ? JSON.parse(row.actual_gpus) : null
   }
@@ -123,12 +176,14 @@ export function rowToAttempt (row) {
     id: row.id,
     taskId: row.task_id,
     attemptNo: row.attempt_no,
+    gpuIndices: parseSlotArray(row.gpu_indices, row.gpu_index, { emptyWhenNull: true }),
     gpuIndex: row.gpu_index,
     pid: row.pid,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
     exitCode: row.exit_code,
     outcome: row.outcome,
+    peakMemPerGpu: parseSlotArray(row.peak_mem_per_gpu, row.peak_mem_mb),
     peakMemMb: row.peak_mem_mb
   }
 }

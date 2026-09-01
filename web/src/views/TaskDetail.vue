@@ -33,11 +33,37 @@ const elapsed = computed(() => {
   return (t.finishedAt ?? now.value) - t.startedAt
 })
 
+// 跑到分配集合之外的卡上才算漂移；只用了其中一部分是「声明多了」，另作提示
 const gpuDrift = computed(() => {
   const t = task.value
-  if (!t?.actualGpus?.length || t.gpuIndex === null) return null
-  if (t.actualGpus.includes(t.gpuIndex)) return null
-  return t.actualGpus.join('、')
+  if (!t?.actualGpus?.length || !t.gpuIndices?.length) return null
+  const strays = t.actualGpus.filter(g => !t.gpuIndices.includes(g))
+  return strays.length ? strays.join('、') : null
+})
+
+const partialUse = computed(() => {
+  const t = task.value
+  if (t?.status !== 'running' || !t.actualGpus?.length || !t.gpuIndices?.length) return null
+  if (t.actualGpus.some(g => !t.gpuIndices.includes(g))) return null
+  const idle = t.gpuIndices.filter(g => !t.actualGpus.includes(g))
+  return idle.length ? idle.join('、') : null
+})
+
+const assignedGpus = computed(() =>
+  task.value?.gpuIndices?.length ? `GPU ${task.value.gpuIndices.join('、')}` : '—'
+)
+
+const memDemand = computed(() => {
+  const mems = task.value?.gpuMems
+  if (!mems?.length) return '—'
+  return mems.length === 1 ? formatMb(mems[0]) : mems.map(formatMb).join(' + ')
+})
+
+const peakDisplay = computed(() => {
+  const t = task.value
+  if (!t?.peakMemMb) return formatMb(t?.peakMemMb)
+  const perGpu = t.peakMemPerGpu
+  return perGpu?.length > 1 ? perGpu.map(formatMb).join(' + ') : formatMb(t.peakMemMb)
 })
 
 const attemptOptions = computed(() =>
@@ -162,11 +188,19 @@ const envEntries = computed(() => Object.entries(task.value?.env ?? {}))
       <n-spin :show="loading">
         <template v-if="task">
           <n-alert v-if="gpuDrift" type="error" title="分流被绕过" style="margin-bottom: 16px;">
-            调度器把它分配到 <strong>GPU {{ task.gpuIndex }}</strong>，但 nvidia-smi 观测到它实际运行在
-            <strong>GPU {{ gpuDrift }}</strong> 上。
+            调度器把它分配到 <strong>{{ assignedGpus }}</strong>，但 nvidia-smi 观测到它还占用了
+            <strong>GPU {{ gpuDrift }}</strong>。
             常见原因：工作目录下的 .env 设置了 CUDA_VISIBLE_DEVICES 且以覆盖方式加载
             （<n-text code>load_dotenv(override=True)</n-text>、<n-text code>source .env</n-text>、direnv），
-            或代码里硬编码了卡号。此时显存账本对这两张卡的记账都已不可信。
+            或代码里硬编码了卡号。此时显存账本对涉及的卡的记账都已不可信。
+          </n-alert>
+
+          <n-alert v-else-if="partialUse" type="warning" title="申请的卡没用满" style="margin-bottom: 16px;">
+            这个任务分配到 <strong>{{ assignedGpus }}</strong>，但只在其中一部分上观测到显存占用，
+            <strong>GPU {{ partialUse }}</strong> 被预留着却闲置。
+            常见原因是 <n-text code>device_map="auto"</n-text> 发现模型塞得下就没用第二张卡——
+            这种情况把它改成更少的卡数即可。
+            若那张在用的卡实际占用远超声明值，则更可能是 .env 把 CUDA_VISIBLE_DEVICES 覆盖成了单卡。
           </n-alert>
 
           <n-alert v-if="task.failReason" :type="task.status === 'failed' ? 'error' : 'warning'" style="margin-bottom: 16px;">
@@ -178,13 +212,13 @@ const envEntries = computed(() => Object.entries(task.value?.env ?? {}))
               <n-statistic label="运行时长" :value="elapsed !== null ? formatDuration(elapsed) : '—'" />
             </n-gi>
             <n-gi>
-              <n-statistic label="分配 GPU" :value="task.gpuIndex !== null ? `GPU ${task.gpuIndex}` : '—'" />
+              <n-statistic label="分配 GPU" :value="assignedGpus" />
             </n-gi>
             <n-gi>
-              <n-statistic label="显存需求" :value="formatMb(task.memRequiredMb)" />
+              <n-statistic :label="task.gpuMems?.length > 1 ? '显存需求（每卡）' : '显存需求'" :value="memDemand" />
             </n-gi>
             <n-gi>
-              <n-statistic label="实测峰值" :value="formatMb(task.peakMemMb)" />
+              <n-statistic :label="task.peakMemPerGpu?.length > 1 ? '实测峰值（每卡）' : '实测峰值'" :value="peakDisplay" />
             </n-gi>
           </n-grid>
 

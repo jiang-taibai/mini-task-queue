@@ -48,6 +48,10 @@ const DEFAULTS = {
     maxRetries: 3,
     // 运行时长低于此值且日志含 OOM 关键字 -> 判定为抢卡失败而非真失败
     oomWindowSeconds: 90,
+    // 某张卡上实测占用超过该槽位声明值的这个倍数即告警。
+    // 多卡下最隐蔽的失效是「两个槽位塌缩到同一张卡」——用的卡确实在分配集合里，
+    // 集合判定抓不到，只有按卡比对数值才看得见。
+    overrunRatio: 1.5,
     // 停止任务时 SIGTERM 到 SIGKILL 的宽限期
     killGraceSeconds: 10
   }
