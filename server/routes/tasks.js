@@ -361,11 +361,16 @@ export function createTasksRouter ({ db, scheduler, gpu, cfg }) {
     }
 
     const status = task.dependsOn.length > 0 ? 'blocked' : 'pending'
+    // 只把 retry_count 归零，attempt_count 保持不动：新一轮从下一个编号往后写，
+    // 上一轮的 attempt-<n>.log 和 attempts 记录原样留着可查。
+    // 归零 attempt_count 会让两轮共用编号——日志被追加进同一个文件，
+    // attempts 表出现两行同号记录，之后所有 `WHERE attempt_no = ?` 的更新
+    // 会同时改到两行，把上一轮的结果覆盖掉
     db.prepare(`
       UPDATE tasks
-      SET status = ?, attempt_count = 0, stop_requested = 0, pid = NULL, pgid = NULL,
-          proc_starttime = NULL, gpu_index = NULL, started_at = NULL, finished_at = NULL,
-          exit_code = NULL, fail_reason = NULL
+      SET status = ?, retry_count = 0, stop_requested = 0, pid = NULL, pgid = NULL,
+          proc_starttime = NULL, gpu_index = NULL, gpu_indices = NULL,
+          started_at = NULL, finished_at = NULL, exit_code = NULL, fail_reason = NULL
       WHERE id = ?
     `).run(status, id)
 

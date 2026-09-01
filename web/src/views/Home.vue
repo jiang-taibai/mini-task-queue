@@ -9,7 +9,9 @@ import TaskCard from '../components/TaskCard.vue'
 import TaskForm from '../components/TaskForm.vue'
 
 import { api, formatMb, formatDuration } from '../api.js'
-import { state, runningTasks, queuedTasks, finishedTasks, refreshAll, disconnectEvents } from '../store.js'
+import {
+  state, runningTasks, queuedTasks, finishedTasks, finishedSort, refreshAll, disconnectEvents
+} from '../store.js'
 import { toggleTheme, isDark } from '../theme.js'
 
 const router = useRouter()
@@ -44,6 +46,12 @@ const processesByGpu = computed(() => {
 })
 
 const showFinished = ref(false)
+
+const sortOptions = [
+  { label: '按序号', value: 'id' },
+  { label: '按结束时间', value: 'finishedAt' },
+  { label: '按创建时间', value: 'createdAt' }
+]
 
 function openCreate () {
   editTask.value = null
@@ -236,6 +244,24 @@ async function logout () {
             <n-button size="tiny" quaternary @click="showFinished = !showFinished">
               {{ showFinished ? '收起' : '展开' }}
             </n-button>
+            <template v-if="showFinished && finishedTasks.length > 1">
+              <n-select
+                v-model:value="finishedSort.by"
+                size="tiny"
+                :options="sortOptions"
+                style="width: 108px;"
+              />
+              <!-- 正逆序做成一个按钮而不是第二个下拉：它只有两个状态，
+                   点一下就翻转比展开菜单再选快得多 -->
+              <n-button
+                size="tiny"
+                quaternary
+                :title="finishedSort.desc ? '当前逆序，点击改为正序' : '当前正序，点击改为逆序'"
+                @click="finishedSort.desc = !finishedSort.desc"
+              >
+                {{ finishedSort.desc ? '↓ 逆序' : '↑ 正序' }}
+              </n-button>
+            </template>
           </n-space>
           <template v-if="showFinished">
             <n-empty v-if="finishedTasks.length === 0" description="暂无已结束的任务" size="small" />
