@@ -17,6 +17,10 @@ const message = useMessage()
 const submitting = ref(false)
 const warnings = ref([])
 
+// 本轮已经提交成功的任务。有警告时弹窗要留着让人读完，但表单此刻已经「用过了」——
+// 不记住这个状态，再点一次提交就会建出一个重复任务，而「取消」看着又像能撤销。
+const submitted = ref(null)
+
 const form = ref(blank())
 
 const toGb = mb => Math.round(mb / 1024 * 10) / 10
@@ -59,9 +63,18 @@ function fromTask (task, { isClone = false } = {}) {
 watch(() => props.show, show => {
   if (!show) return
   warnings.value = []
+  submitted.value = null
   if (props.editTask) form.value = fromTask(props.editTask)
   else if (props.cloneFrom) form.value = fromTask(props.cloneFrom, { isClone: true })
   else form.value = blank()
+})
+
+// 提交成功后要把「任务已经建好了」说明白，否则弹窗没关会让人以为提交失败
+const warningTitle = computed(() => {
+  if (!submitted.value) return '请注意'
+  return props.editTask
+    ? '已保存，但有几点需要注意'
+    : `任务 #${submitted.value.id} 已加入队列，但有几点需要注意`
 })
 
 const title = computed(() => {
@@ -130,6 +143,7 @@ function buildPayload () {
 }
 
 async function submit () {
+  if (submitted.value) return // 已经提交过了，再点就是重复建任务
   submitting.value = true
   warnings.value = []
   try {
@@ -143,6 +157,7 @@ async function submit () {
 
     // 有警告时留在表单上让用户看清楚，没有就直接关闭
     if (warnings.value.length === 0) emit('update:show', false)
+    else submitted.value = result.task
     emit('saved', result.task)
   } catch (err) {
     message.error(err.message)
@@ -286,17 +301,24 @@ async function submit () {
         </n-space>
       </n-form-item>
 
-      <n-alert v-if="warnings.length" type="warning" title="请注意">
+      <n-alert v-if="warnings.length" type="warning" :title="warningTitle">
         <div v-for="(w, i) in warnings" :key="i">{{ w }}</div>
       </n-alert>
     </n-form>
 
     <template #footer>
       <n-space justify="end">
-        <n-button @click="emit('update:show', false)">取消</n-button>
-        <n-button type="primary" :loading="submitting" @click="submit">
-          {{ editTask ? '保存' : '提交到队列' }}
-        </n-button>
+        <!-- 提交成功后按钮整组换掉：此时「取消」撤销不了任何东西，
+             而再点一次「提交到队列」会建出重复任务 -->
+        <template v-if="submitted">
+          <n-button type="primary" @click="emit('update:show', false)">知道了</n-button>
+        </template>
+        <template v-else>
+          <n-button @click="emit('update:show', false)">取消</n-button>
+          <n-button type="primary" :loading="submitting" @click="submit">
+            {{ editTask ? '保存' : '提交到队列' }}
+          </n-button>
+        </template>
       </n-space>
     </template>
   </n-modal>
