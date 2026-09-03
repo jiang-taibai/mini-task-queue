@@ -30,15 +30,28 @@ const { Scheduler } = await import('./scheduler.js')
 class FakeRunner {
   constructor () {
     this.launched = []
+    this.stopped = []
     this.alive = new Set()
     this.nextPid = 1000
+    /** 非 null 时 launch 不立即 resolve，用来把「已 spawn 但还没落库」这段窗口拉长 */
+    this.held = null
   }
 
   async launch (task, gpuIndices, attemptNo) {
     const pid = this.nextPid++
     this.alive.add(pid)
     this.launched.push({ taskId: task.id, gpuIndices: [...gpuIndices], attemptNo, pid })
-    return { pid, pgid: pid, procStarttime: 'fake', logPath: '/dev/null' }
+    const result = { pid, pgid: pid, procStarttime: 'fake', logPath: '/dev/null' }
+    if (!this.held) return result
+    return new Promise(resolve => this.held.push(() => resolve(result)))
+  }
+
+  hold () { this.held = [] }
+
+  release () {
+    const pending = this.held ?? []
+    this.held = null
+    for (const resolve of pending) resolve()
   }
 
   // mock 数据源里进程的 pid 就是我们记的 pgid
@@ -46,7 +59,7 @@ class FakeRunner {
   isAlive (task) { return this.alive.has(task.pid) }
   readExitCode () { return null }
   forget () {}
-  stopTask () { return true }
+  stopTask (task) { this.stopped.push(task.pid); return true }
 }
 
 function setup ({ mem = MEM_TOTAL, allocDelayMs = 1000 } = {}) {
@@ -298,6 +311,57 @@ test('重排后的一轮沿用新编号写日志，不覆盖上一轮', async ()
     '从 1 重新开始会写进上一轮的 attempt-1.log，并让 attempts 表出现同号两行'
   )
   assert.equal(scheduler.getTask(id).retryCount, 1, '本轮的自动重试预算独立计数')
+})
+
+test('launch 还没落库时，下一拍不能把同一个任务再派一次', async () => {
+  const { db, scheduler, runner, pump } = setup()
+  const id = addTask(db, [10000])
+
+  // launch 是异步的，落库前任务在库里仍是 pending——这段窗口在真机上由慢磁盘
+  // 或负载拉长，这里直接把它挂住
+  runner.hold()
+  pump()
+  scheduler.tick()
+  pump()
+  scheduler.tick()
+
+  assert.equal(
+    runner.launched.length, 1,
+    '两次派发会拿到同一个 attemptNo：两个进程写同一个 attempt-<n>.log，' +
+    '后落库的那次撞唯一索引被标成失败，而它 spawn 的进程还在卡上吃显存'
+  )
+
+  runner.release()
+  await settle()
+
+  const task = scheduler.getTask(id)
+  assert.equal(task.status, 'running')
+  assert.equal(task.attemptCount, 1)
+  assert.equal(db.prepare('SELECT COUNT(*) AS c FROM attempts WHERE task_id = ?').get(id).c, 1)
+})
+
+test('记账失败时杀掉已经 spawn 的进程，不留下账本之外的显存占用', async () => {
+  const { db, scheduler, runner, pump } = setup()
+  const id = addTask(db, [10000])
+  // 占住 attempt_no = 1，让落库时的 INSERT 必然撞唯一索引。
+  // 模拟的是「库里有意料之外的数据」——唯一索引没建成时留下的脏行就是这样
+  db.prepare(`
+    INSERT INTO attempts (task_id, attempt_no, started_at, log_path)
+    VALUES (?, 1, 0, '/dev/null')
+  `).run(id)
+
+  pump()
+  scheduler.tick()
+  await settle()
+
+  const task = scheduler.getTask(id)
+  assert.equal(task.status, 'failed')
+  assert.match(task.failReason, /UNIQUE/)
+  assert.deepEqual(
+    runner.stopped, [runner.launched[0].pid],
+    '进程已经起来了而账本没记下它，放着不管那张卡会被继续派任务，症状是毫无来由的 OOM'
+  )
+  assert.equal(scheduler.reservations.has(id), false)
 })
 
 test('gpu_mems 为空的历史行回退成单卡，不会炸', async () => {

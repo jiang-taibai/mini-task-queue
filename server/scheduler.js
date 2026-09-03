@@ -45,6 +45,18 @@ export class Scheduler extends EventEmitter {
      */
     this.reservations = new Map()
 
+    /**
+     * 已经派出去、但落库还没完成的任务 id。
+     *
+     * launch 是异步的，这段窗口里任务在库里仍然是 pending——没有这个标记，
+     * getQueue() 下一拍还会把它选出来再派一次，而 pruneReservations() 会因为
+     * 它「不是 running」把预留删掉。两个后果都指向同一种事故：同一个任务的
+     * 两个进程抢同一个 attemptNo，或者卡上的显存没人记账。
+     *
+     * 只在本进程内有效，靠 launchTask 里的条件更新兜住跨进程的情况。
+     */
+    this.launching = new Set()
+
     /** 进程已消失但退出码文件还没落盘的任务：taskId -> 首次发现消失的时刻 */
     this.awaitingExitCode = new Map()
 
@@ -343,7 +355,9 @@ export class Scheduler extends EventEmitter {
 
     for (const [taskId, entries] of this.reservations) {
       const task = this.getTask(taskId)
-      if (!task || task.status !== 'running') {
+      // launching 的任务在库里还是 pending，但预留必须留着：进程已经在起了，
+      // 此刻删掉预留等于把那份显存重新当成空闲派给别人
+      if (!task || (task.status !== 'running' && !this.launching.has(taskId))) {
         this.reservations.delete(taskId)
         continue
       }
@@ -449,13 +463,21 @@ export class Scheduler extends EventEmitter {
       // 想让小任务先跑，把它拖到队头就是——那才是这套系统里的「回填」。
       if (task.status === 'blocked') break
 
+      // 已经派出去、只是还没落库。它在库里仍是 pending，再派一次就是两个进程
+      // 抢同一个 attemptNo。等一拍即可——落库后它就变 running 了
+      if (this.launching.has(task.id)) break
+
       const gpuIndices = this.pickGpus(task, runningByGpu)
       if (gpuIndices === null) break
 
       try {
-        this.launchTask(task, gpuIndices)
-        for (const idx of gpuIndices) runningByGpu.set(idx, (runningByGpu.get(idx) ?? 0) + 1)
+        if (this.launchTask(task, gpuIndices)) {
+          for (const idx of gpuIndices) runningByGpu.set(idx, (runningByGpu.get(idx) ?? 0) + 1)
+        }
       } catch (err) {
+        // launch 同步抛出时 promise 回调不会跑，标记得在这里清掉——
+        // 漏一次这个任务就再也不会被派发，而且不会有任何报错
+        this.launching.delete(task.id)
         console.error(`[scheduler] 启动任务 #${task.id} 失败:`, err)
         this.db.prepare(`
           UPDATE tasks SET status = 'failed', finished_at = ?, fail_reason = ? WHERE id = ?
@@ -466,7 +488,27 @@ export class Scheduler extends EventEmitter {
     }
   }
 
+  /**
+   * 派发一个任务；抢不到这一拍返回 false。
+   *
+   * 编号必须在这里同步占掉，不能等 launch 回来再写。launch 是异步的，在它落库
+   * 之前任务在库里还是 pending，而 getQueue() 选的就是 pending、countRunningByGpu()
+   * 只数 running——没有任何东西表示「这个任务正在启动中」。于是下一拍会把同一个
+   * 任务再派一次，两次拿到同一个 attemptNo：两个进程写进同一个 attempt-<n>.log，
+   * 后落库的那次撞唯一索引，被标成「启动失败：UNIQUE constraint failed」，
+   * 而它 spawn 出来的进程还在卡上吃着显存。
+   *
+   * 条件更新即乐观锁：attempt_count 没被别人动过才算抢到。SQLite 同一时刻只有
+   * 一个写者，所以这条规则对「不小心起了两个服务实例连同一个库」同样成立。
+   */
   launchTask (task, gpuIndices) {
+    const claimed = this.db.prepare(`
+      UPDATE tasks SET attempt_count = attempt_count + 1
+      WHERE id = ? AND attempt_count = ? AND status = 'pending'
+    `).run(task.id, task.attemptCount)
+    if (claimed.changes === 0) return false
+    this.launching.add(task.id)
+
     // 编号单调递增，跨轮不复位：它决定写哪个 attempt-<n>.log
     const attemptNo = task.attemptCount + 1
     const retryCount = task.retryCount + 1
@@ -482,17 +524,21 @@ export class Scheduler extends EventEmitter {
       expiresAt
     })))
 
-    this.runner.launch(task, gpuIndices, attemptNo).then(({ pid, pgid, procStarttime, logPath }) => {
+    this.runner.launch(task, gpuIndices, attemptNo).then(proc => {
+      const { pid, pgid, procStarttime, logPath } = proc
       this.db.exec('BEGIN')
       try {
+        // attempt_count 已在上面占号时推进过，这里不再写：它的唯一推进点就是那一条
+        // 条件更新，多一处写入就多一条绕过乐观锁的路
+        //
         // gpu_index 写槽位 0，仅为让回退到旧版本的服务仍能启动，不参与新逻辑
         this.db.prepare(`
           UPDATE tasks
           SET status = 'running', gpu_index = ?, gpu_indices = ?, pid = ?, pgid = ?, proc_starttime = ?,
-              started_at = ?, attempt_count = ?, retry_count = ?,
+              started_at = ?, retry_count = ?,
               finished_at = NULL, exit_code = NULL, fail_reason = NULL
           WHERE id = ?
-        `).run(gpuIndices[0], indicesJson, pid, pgid, procStarttime, now, attemptNo, retryCount, task.id)
+        `).run(gpuIndices[0], indicesJson, pid, pgid, procStarttime, now, retryCount, task.id)
 
         this.db.prepare(`
           INSERT INTO attempts (task_id, attempt_no, gpu_index, gpu_indices, pid, pgid, started_at, log_path)
@@ -501,13 +547,16 @@ export class Scheduler extends EventEmitter {
         this.db.exec('COMMIT')
       } catch (err) {
         this.db.exec('ROLLBACK')
+        this.killOrphan(task, proc, gpuIndices)
         throw err
       }
 
+      this.launching.delete(task.id)
       this.gpu.mock?.noteTaskStart(pgid, gpuIndices, task.gpuMems)
       this.emit('log', `任务 #${task.id}「${task.name}」已派往 GPU ${gpuIndices.join('、')}（第 ${attemptNo} 次尝试）`)
       this.emitChange(task.id)
     }).catch(err => {
+      this.launching.delete(task.id)
       this.reservations.delete(task.id)
       console.error(`[scheduler] 任务 #${task.id} 启动失败:`, err)
       this.db.prepare(`
@@ -515,6 +564,29 @@ export class Scheduler extends EventEmitter {
       `).run(Date.now(), `启动失败：${err.message}`, task.id)
       this.emitChange(task.id)
     })
+
+    return true
+  }
+
+  /**
+   * 记账失败但进程已经 spawn 出去了——杀掉它。
+   *
+   * 事务回滚只撤销了库里的行，进程不会跟着消失。任务随后被标成 failed，于是
+   * getRunning() 再也看不见它，而它仍在卡上吃着显存：那张卡会被继续派任务，
+   * 症状是毫无来由的 OOM。宁可让这次尝试彻底失败，也不留一份账本之外的占用。
+   *
+   * 杀不掉只记日志：此刻已经在异常路径上，再抛一次只会盖掉真正的原因。
+   */
+  killOrphan (task, { pid, pgid, procStarttime }, gpuIndices) {
+    try {
+      this.runner.stopTask({ pid, pgid, procStarttime })
+      this.runner.forget(task.id)
+      this.emit('log', `⚠ 任务 #${task.id}「${task.name}」记账失败，已终止刚启动的进程（pid ${pid}）`)
+    } catch (err) {
+      console.error(
+        `[scheduler] 任务 #${task.id} 记账失败后未能终止进程 ${pid}，` +
+        `它仍占着 GPU ${gpuIndices.join('、')} 且不在账本内，请手动清理:`, err.message)
+    }
   }
 
   // —— 显存峰值采集 ——
