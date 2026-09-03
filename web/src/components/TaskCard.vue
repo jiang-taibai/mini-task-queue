@@ -1,6 +1,10 @@
 <script setup>
 import { computed } from 'vue'
+import { useThemeVars } from 'naive-ui'
 import { formatMb, formatDuration, formatTime, STATUS_META } from '../api.js'
+
+// 链接色从主题里取，明暗两套自动跟随
+const themeVars = useThemeVars()
 
 const props = defineProps({
   task: { type: Object, required: true },
@@ -146,14 +150,25 @@ const memDemand = computed(() => {
 .drag-handle:active {
   cursor: grabbing;
 }
+/*
+ * 换成 router-link 之后它才真正带上了 href，于是浏览器的默认链接样式生效了——
+ * #0000EE 加常驻下划线，在深色主题上几乎看不清。这里把默认态压回正文色：
+ * 任务名是列表的主体内容，整列染成主题色只会更花，可点性交给 hover 表达。
+ */
 .name {
   font-weight: 500;
   cursor: pointer;
   flex: 1;
   min-width: 140px;
+  color: inherit;
+  text-decoration: none;
+  transition: color 0.2s var(--n-bezier, ease-in-out);
 }
 .name:hover {
-  text-decoration: underline;
+  color: v-bind('themeVars.primaryColor');
+}
+.name:active {
+  color: v-bind('themeVars.primaryColorPressed');
 }
 .facts {
   font-size: 12px;
