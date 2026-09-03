@@ -1,7 +1,10 @@
 <script setup>
 import { computed } from 'vue'
-import { useRouter } from 'vue-router'
+import { useThemeVars } from 'naive-ui'
 import { formatMb, formatDuration, formatTime, STATUS_META } from '../api.js'
+
+// 链接色从主题里取，明暗两套自动跟随
+const themeVars = useThemeVars()
 
 const props = defineProps({
   task: { type: Object, required: true },
@@ -9,8 +12,6 @@ const props = defineProps({
   now: { type: Number, default: () => Date.now() }
 })
 const emit = defineEmits(['stop', 'edit', 'clone', 'remove', 'requeue'])
-
-const router = useRouter()
 
 const meta = computed(() => STATUS_META[props.task.status] ?? { label: props.task.status, type: 'default' })
 
@@ -22,11 +23,14 @@ const elapsed = computed(() => {
 })
 
 // 队列里的等待时长要显眼：严格门控下一个排不上的任务会挡住所有人，
-// 你需要一眼看出该不该插手
+// 你需要一眼看出该不该插手。
+//
+// 从 queuedAt 而不是 createdAt 算起：重新排队的任务是刚排上队的，
+// 按创建时间算会显示「已等待 20 小时」，把真正该关注的队头淹掉
 const waiting = computed(() => {
   const t = props.task
   if (t.status !== 'pending' && t.status !== 'blocked') return null
-  return props.now - t.createdAt
+  return props.now - (t.queuedAt ?? t.createdAt)
 })
 
 const isActive = computed(() => ['running', 'pending', 'blocked'].includes(props.task.status))
@@ -44,6 +48,7 @@ const assignedGpus = computed(() => props.task.gpuIndices?.join('、') ?? '')
 
 const memDemand = computed(() => {
   const mems = props.task.gpuMems ?? [props.task.memRequiredMb]
+  if (mems.length === 0) return '纯 CPU'
   return mems.length === 1
     ? `需 ${formatMb(mems[0])}`
     : `需 ${mems.length} 卡 · ${mems.map(formatMb).join(' + ')}`
@@ -57,10 +62,12 @@ const memDemand = computed(() => {
 
       <n-tag :type="meta.type" size="small" :bordered="false">{{ meta.label }}</n-tag>
 
-      <a class="name" @click="router.push(`/task/${task.id}`)">
+      <!-- 用真链接而不是 @click=router.push：RouterLink 内部会放行带 ctrl/cmd/shift
+           的点击，交给浏览器原生处理，于是「新标签页打开」这个肌肉记忆能用 -->
+      <router-link class="name" :to="`/task/${task.id}`">
         <n-text depth="3">#{{ task.id }}</n-text>
         {{ task.name }}
-      </a>
+      </router-link>
 
       <n-space :size="14" align="center" class="facts">
         <n-text v-if="assignedGpus && task.status === 'running'" depth="2">
@@ -85,7 +92,9 @@ const memDemand = computed(() => {
           编辑
         </n-button>
         <n-button size="tiny" quaternary @click="emit('clone', task)">克隆</n-button>
-        <n-button size="tiny" quaternary @click="router.push(`/task/${task.id}`)">详情</n-button>
+        <router-link v-slot="{ href, navigate }" :to="`/task/${task.id}`" custom>
+          <n-button size="tiny" quaternary tag="a" :href="href" @click="navigate">详情</n-button>
+        </router-link>
         <n-button
           v-if="task.status !== 'running'"
           size="tiny"
@@ -141,14 +150,25 @@ const memDemand = computed(() => {
 .drag-handle:active {
   cursor: grabbing;
 }
+/*
+ * 换成 router-link 之后它才真正带上了 href，于是浏览器的默认链接样式生效了——
+ * #0000EE 加常驻下划线，在深色主题上几乎看不清。这里把默认态压回正文色：
+ * 任务名是列表的主体内容，整列染成主题色只会更花，可点性交给 hover 表达。
+ */
 .name {
   font-weight: 500;
   cursor: pointer;
   flex: 1;
   min-width: 140px;
+  color: inherit;
+  text-decoration: none;
+  transition: color 0.2s var(--n-bezier, ease-in-out);
 }
 .name:hover {
-  text-decoration: underline;
+  color: v-bind('themeVars.primaryColor');
+}
+.name:active {
+  color: v-bind('themeVars.primaryColorPressed');
 }
 .facts {
   font-size: 12px;

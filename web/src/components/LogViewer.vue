@@ -142,6 +142,7 @@ defineExpose({ reload: loadTail })
     <n-log
       ref="logRef"
       :log="displayed"
+      language="mtq-log"
       :rows="26"
       :font-size="12"
       :line-height="1.5"

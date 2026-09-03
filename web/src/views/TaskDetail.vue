@@ -1,10 +1,18 @@
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, h, defineAsyncComponent } from 'vue'
 import { useRouter } from 'vue-router'
-import { useMessage, useDialog } from 'naive-ui'
+import { useMessage, useDialog, NSkeleton } from 'naive-ui'
 
 import LogViewer from '../components/LogViewer.vue'
 import TaskForm from '../components/TaskForm.vue'
+
+// 和 TaskForm 里一样按需加载：Monaco 约 770 KB gzip，不该进首屏。
+// 两处引用的是同一个 chunk，先打开过任务弹窗的话这里就是缓存命中
+const CommandEditor = defineAsyncComponent({
+  loader: () => import('../components/CommandEditor.vue'),
+  loadingComponent: { render: () => h(NSkeleton, { text: false, height: 40, style: 'border-radius: 3px;' }) },
+  delay: 150
+})
 import { api, formatMb, formatBytes, formatTime, formatDuration, STATUS_META } from '../api.js'
 import { state } from '../store.js'
 
@@ -82,6 +90,18 @@ function outcomeLabel (outcome) {
     timeout: '超时',
     unknown: '结果未知'
   }[outcome] ?? '运行中'
+}
+
+/**
+ * 站内跳到另一个任务。
+ *
+ * 带 ctrl/cmd/shift 或中键时直接返回，让 <a href> 走浏览器原生行为——
+ * 这正是「在新标签页打开」赖以工作的机制，拦下来就没了。
+ */
+function openTask (id, e) {
+  if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey || e.button !== 0) return
+  e.preventDefault()
+  router.push(`/task/${id}`)
 }
 
 async function load () {
@@ -230,9 +250,6 @@ const envEntries = computed(() => Object.entries(task.value?.env ?? {}))
               <n-descriptions-item label="尝试次数">
                 {{ task.attemptCount }}
               </n-descriptions-item>
-              <n-descriptions-item label="命令" :span="2">
-                <n-text code style="white-space: pre-wrap; word-break: break-all;">{{ task.command }}</n-text>
-              </n-descriptions-item>
               <n-descriptions-item label="限定 GPU">
                 {{ task.allowedGpus ? task.allowedGpus.map(i => `GPU ${i}`).join('、') : '不限' }}
               </n-descriptions-item>
@@ -250,35 +267,47 @@ const envEntries = computed(() => Object.entries(task.value?.env ?? {}))
                   <n-text code>{{ k }}={{ v }}</n-text>
                 </div>
               </n-descriptions-item>
+              <!-- n-tag 不是链接元素，外面套一层真 <a>：带修饰键的点击交还浏览器，
+                   「Ctrl+点击开新标签」才不会失灵 -->
               <n-descriptions-item v-if="detail.dependencies.length" label="前置任务" :span="2">
                 <n-space :size="6">
-                  <n-tag
+                  <a
                     v-for="d in detail.dependencies"
                     :key="d.id"
-                    size="small"
-                    :type="STATUS_META[d.status]?.type ?? 'default'"
-                    style="cursor: pointer;"
-                    @click="router.push(`/task/${d.id}`)"
+                    class="tag-link"
+                    :href="`/task/${d.id}`"
+                    @click="e => openTask(d.id, e)"
                   >
-                    #{{ d.id }} {{ d.name }}
-                  </n-tag>
+                    <n-tag size="small" :type="STATUS_META[d.status]?.type ?? 'default'">
+                      #{{ d.id }} {{ d.name }}
+                    </n-tag>
+                  </a>
                 </n-space>
               </n-descriptions-item>
               <n-descriptions-item v-if="detail.dependents.length" label="下游任务" :span="2">
                 <n-space :size="6">
-                  <n-tag
+                  <a
                     v-for="d in detail.dependents"
                     :key="d.id"
-                    size="small"
-                    :type="STATUS_META[d.status]?.type ?? 'default'"
-                    style="cursor: pointer;"
-                    @click="router.push(`/task/${d.id}`)"
+                    class="tag-link"
+                    :href="`/task/${d.id}`"
+                    @click="e => openTask(d.id, e)"
                   >
-                    #{{ d.id }} {{ d.name }}
-                  </n-tag>
+                    <n-tag size="small" :type="STATUS_META[d.status]?.type ?? 'default'">
+                      #{{ d.id }} {{ d.name }}
+                    </n-tag>
+                  </a>
                 </n-space>
               </n-descriptions-item>
             </n-descriptions>
+          </n-card>
+
+          <!-- 命令单独成块，不塞进上面的描述列表。
+               n-descriptions 是 table 布局，格子里放一个 width:100% 的编辑器会让
+               浏览器把宽度全分给这一列，把左边的 label 挤成竖排单字。
+               何况命令本来就常常很长，独占一块也更好读 -->
+          <n-card size="small" title="命令" style="margin-bottom: 16px;">
+            <CommandEditor :value="task.command" readonly :min-rows="1" :max-rows="16" />
           </n-card>
 
           <n-card size="small" title="日志">
@@ -316,6 +345,11 @@ const envEntries = computed(() => Object.entries(task.value?.env ?? {}))
 </template>
 
 <style scoped>
+/* n-tag 自己控制配色，外层这层 <a> 只负责承接 href，样式一律不掺和 */
+.tag-link {
+  color: inherit;
+  text-decoration: none;
+}
 .header {
   display: flex;
   align-items: center;

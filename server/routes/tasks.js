@@ -52,12 +52,17 @@ export function createTasksRouter ({ db, scheduler, gpu, cfg }) {
     if (!command) errors.push('命令不能为空')
 
     // 槽位数组是真相源；memRequiredMb 退化为各槽位之和，只用于展示与旧版本兼容
-    let gpuMems = Array.isArray(body.gpuMems)
+    //
+    // 空数组是合法的：那是纯 CPU 任务，不分配任何卡。但它必须由 gpuMems 显式表达——
+    // 两个字段都没传只能是客户端漏了，那种情况仍要拦，否则一个字段名写错的请求
+    // 会静默变成 CPU 任务
+    const declaredSlots = Array.isArray(body.gpuMems)
+    let gpuMems = declaredSlots
       ? body.gpuMems.map(Number)
       : (body.memRequiredMb === undefined ? [] : [Number(body.memRequiredMb)])
 
-    if (gpuMems.length === 0) {
-      errors.push('至少要声明一张卡的显存需求')
+    if (!declaredSlots && gpuMems.length === 0) {
+      errors.push('至少要声明一张卡的显存需求（纯 CPU 任务请显式提交 gpuMems: []）')
     } else if (gpuMems.some(m => !Number.isFinite(m) || m <= 0)) {
       errors.push('每张卡的显存需求必须是正数（单位 MB）')
       gpuMems = []
@@ -129,16 +134,27 @@ export function createTasksRouter ({ db, scheduler, gpu, cfg }) {
 
     // 命令里硬编码卡号会让分流静默错位：任务跑到非预期的卡上，账本却以为它在别处。
     // 多卡任务里 cuda:1 是完全正当的写法，只有超出本任务可见范围的卡号才值得提醒。
-    const visibleCount = gpuMems.length || 1
-    const outOfRange = [...new Set(
-      [...command.matchAll(/\bcuda:(\d+)\b/g)].map(m => Number(m[1])).filter(n => n >= visibleCount)
+    const mentionedGpus = [...new Set(
+      [...command.matchAll(/\bcuda:(\d+)\b/g)].map(m => Number(m[1]))
     )].sort((a, b) => a - b)
 
-    if (outOfRange.length) {
-      warnings.push(visibleCount === 1
-        ? '命令中出现了 cuda:1 之类的硬编码卡号。分流靠 CUDA_VISIBLE_DEVICES 实现，设定后代码里应统一使用 cuda:0'
-        : `命令中出现了 ${outOfRange.map(n => `cuda:${n}`).join('、')}，` +
-          `超出本任务申请的 ${visibleCount} 张卡——脚本只看得见 cuda:0 到 cuda:${visibleCount - 1}`)
+    if (gpuMems.length === 0) {
+      // 纯 CPU 任务：CUDA_VISIBLE_DEVICES 会被设成空串，任何卡号都用不了。
+      // 这多半是「忘了把卡数改回去」，不拦但必须说清楚，否则只会看到一句 CUDA 报错
+      if (mentionedGpus.length > 0) {
+        warnings.push('这是纯 CPU 任务（0 张卡），但命令里出现了 ' +
+          `${mentionedGpus.map(n => `cuda:${n}`).join('、')}。` +
+          'CUDA_VISIBLE_DEVICES 会被设为空，脚本看不到任何 GPU')
+      }
+    } else {
+      const visibleCount = gpuMems.length
+      const outOfRange = mentionedGpus.filter(n => n >= visibleCount)
+      if (outOfRange.length) {
+        warnings.push(visibleCount === 1
+          ? '命令中出现了 cuda:1 之类的硬编码卡号。分流靠 CUDA_VISIBLE_DEVICES 实现，设定后代码里应统一使用 cuda:0'
+          : `命令中出现了 ${outOfRange.map(n => `cuda:${n}`).join('、')}，` +
+            `超出本任务申请的 ${visibleCount} 张卡——脚本只看得见 cuda:0 到 cuda:${visibleCount - 1}`)
+      }
     }
 
     warnings.push(...checkDotenv(cwd))
@@ -255,15 +271,16 @@ export function createTasksRouter ({ db, scheduler, gpu, cfg }) {
     const maxOrder = db.prepare('SELECT COALESCE(MAX(queue_order), 0) AS m FROM tasks').get().m
     const status = value.dependsOn.length > 0 ? 'blocked' : 'pending'
 
+    const now = Date.now()
     const info = db.prepare(`
       INSERT INTO tasks (name, cwd, command, mem_required_mb, gpu_mems, allowed_gpus, env, depends_on,
-                         timeout_seconds, status, queue_order, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         timeout_seconds, status, queue_order, created_at, queued_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       value.name, value.cwd, value.command, value.memRequiredMb, JSON.stringify(value.gpuMems),
       value.allowedGpus ? JSON.stringify(value.allowedGpus) : null,
       JSON.stringify(value.env), JSON.stringify(value.dependsOn),
-      value.timeoutSeconds, status, maxOrder + 1000, Date.now()
+      value.timeoutSeconds, status, maxOrder + 1000, now, now
     )
 
     const task = getTask(Number(info.lastInsertRowid))
@@ -366,13 +383,14 @@ export function createTasksRouter ({ db, scheduler, gpu, cfg }) {
     // 归零 attempt_count 会让两轮共用编号——日志被追加进同一个文件，
     // attempts 表出现两行同号记录，之后所有 `WHERE attempt_no = ?` 的更新
     // 会同时改到两行，把上一轮的结果覆盖掉
+    // queued_at 重置：等待时长该从「这一次排上队」算起，而不是最初创建的时刻
     db.prepare(`
       UPDATE tasks
       SET status = ?, retry_count = 0, stop_requested = 0, pid = NULL, pgid = NULL,
-          proc_starttime = NULL, gpu_index = NULL, gpu_indices = NULL,
+          proc_starttime = NULL, gpu_index = NULL, gpu_indices = NULL, queued_at = ?,
           started_at = NULL, finished_at = NULL, exit_code = NULL, fail_reason = NULL
       WHERE id = ?
-    `).run(status, id)
+    `).run(status, Date.now(), id)
 
     scheduler.emitChange(id)
     scheduler.tick()

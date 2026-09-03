@@ -12,6 +12,7 @@
     "test": "node --test server/*.test.js",
     "start": "node server/index.js",
     "stop": "node server/stop.js",
+    "orphans": "node server/orphans.js",
     "dev": "concurrently -n server,web -c blue,green \"node --watch server/index.js\" \"vite\"",
     "build": "vite build"
   },
@@ -22,6 +23,8 @@
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.8",
     "concurrently": "^10.0.5",
+    "highlight.js": "^11.12.0",
+    "monaco-editor": "^0.56.0",
     "naive-ui": "^2.45.3",
     "vite": "^8.2.2",
     "vue": "^3.5.42",

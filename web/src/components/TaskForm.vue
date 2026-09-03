@@ -1,8 +1,19 @@
 <script setup>
-import { ref, computed, watch } from 'vue'
-import { useMessage } from 'naive-ui'
+import { ref, computed, watch, h, defineAsyncComponent } from 'vue'
+import { useMessage, useNotification, NSkeleton } from 'naive-ui'
 import { api, formatMb } from '../api.js'
 import { state } from '../store.js'
+
+// Monaco 比整个应用的其余部分加起来还大（约 770 KB gzip，主包才 428 KB），
+// 而它只在这个弹窗里用得到。懒加载让首屏不必为它买单。
+//
+// 经 frp 从外网访问时这一下要等几秒，所以给个骨架屏——没有占位的话
+// 弹窗会先空着一块，看着像卡死了
+const CommandEditor = defineAsyncComponent({
+  loader: () => import('./CommandEditor.vue'),
+  loadingComponent: { render: () => h(NSkeleton, { text: false, height: 69, style: 'border-radius: 3px;' }) },
+  delay: 150
+})
 
 const props = defineProps({
   show: { type: Boolean, default: false },
@@ -14,12 +25,8 @@ const props = defineProps({
 const emit = defineEmits(['update:show', 'saved'])
 
 const message = useMessage()
+const notification = useNotification()
 const submitting = ref(false)
-const warnings = ref([])
-
-// 本轮已经提交成功的任务。有警告时弹窗要留着让人读完，但表单此刻已经「用过了」——
-// 不记住这个状态，再点一次提交就会建出一个重复任务，而「取消」看着又像能撤销。
-const submitted = ref(null)
 
 const form = ref(blank())
 
@@ -62,19 +69,9 @@ function fromTask (task, { isClone = false } = {}) {
 
 watch(() => props.show, show => {
   if (!show) return
-  warnings.value = []
-  submitted.value = null
   if (props.editTask) form.value = fromTask(props.editTask)
   else if (props.cloneFrom) form.value = fromTask(props.cloneFrom, { isClone: true })
   else form.value = blank()
-})
-
-// 提交成功后要把「任务已经建好了」说明白，否则弹窗没关会让人以为提交失败
-const warningTitle = computed(() => {
-  if (!submitted.value) return '请注意'
-  return props.editTask
-    ? '已保存，但有几点需要注意'
-    : `任务 #${submitted.value.id} 已加入队列，但有几点需要注意`
 })
 
 const title = computed(() => {
@@ -98,11 +95,13 @@ const gpuOptions = computed(() =>
   state.gpu.devices.map(d => ({ label: `GPU ${d.index} · ${d.name}`, value: d.index }))
 )
 
-// 上限就是本机卡数：申请更多的话任务永远排不上，后端也会直接拒绝
+// 上限就是本机卡数：申请更多的话任务永远排不上，后端也会直接拒绝。
+// 0 张即纯 CPU 任务，CUDA_VISIBLE_DEVICES 会被设成空
 const deviceCount = computed(() => Math.max(state.gpu.devices.length, 1))
-const gpuCountOptions = computed(() =>
-  Array.from({ length: deviceCount.value }, (_, i) => ({ label: `${i + 1} 张`, value: i + 1 }))
-)
+const gpuCountOptions = computed(() => [
+  { label: '0 张（纯 CPU）', value: 0 },
+  ...Array.from({ length: deviceCount.value }, (_, i) => ({ label: `${i + 1} 张`, value: i + 1 }))
+])
 
 /** 加卡时复制第一个框的值——各卡需求相同是常态，省掉一次交互 */
 function setGpuCount (count) {
@@ -143,21 +142,32 @@ function buildPayload () {
 }
 
 async function submit () {
-  if (submitted.value) return // 已经提交过了，再点就是重复建任务
+  if (submitting.value) return // 双击保护：慢网络下按钮的 loading 态出现前还能再点一下
   submitting.value = true
-  warnings.value = []
   try {
     const payload = buildPayload()
     const result = props.editTask
       ? await api.updateTask(props.editTask.id, payload)
       : await api.createTask(payload)
 
-    warnings.value = result.warnings ?? []
     message.success(props.editTask ? '已保存' : `任务 #${result.task.id} 已加入队列`)
 
-    // 有警告时留在表单上让用户看清楚，没有就直接关闭
-    if (warnings.value.length === 0) emit('update:show', false)
-    else submitted.value = result.task
+    // 成功就一定关闭弹窗。警告另开通知——把它们留在弹窗里会让「已经建好了」
+    // 看着像「提交失败了」，而此时再点一次提交就是建出一个重复任务
+    const warnings = result.warnings ?? []
+    if (warnings.length > 0) {
+      notification.warning({
+        title: props.editTask
+          ? `任务 #${result.task.id} 已保存，但有几点需要注意`
+          : `任务 #${result.task.id} 已加入队列，但有几点需要注意`,
+        content: () => h('div', warnings.map(w => h('div', { style: 'margin-bottom: 6px;' }, w))),
+        // 不自动消失：这些是「能跑起来但多半不是你想要的」，溜走了就等于没提示
+        duration: 0,
+        keepAliveOnHover: true
+      })
+    }
+
+    emit('update:show', false)
     emit('saved', result.task)
   } catch (err) {
     message.error(err.message)
@@ -168,11 +178,14 @@ async function submit () {
 </script>
 
 <template>
+  <!-- 点遮罩/按 Esc 都不关：这个表单填起来要好几分钟，误触一次全没了 -->
   <n-modal
     :show="show"
     preset="card"
     :title="title"
     style="max-width: 720px;"
+    :mask-closable="false"
+    :close-on-esc="false"
     @update:show="v => emit('update:show', v)"
   >
     <n-form label-placement="top" size="small">
@@ -194,13 +207,18 @@ async function submit () {
         </n-gi>
       </n-grid>
 
+      <n-alert v-if="form.memGbs.length === 0" type="info" :bordered="false" style="margin-bottom: 12px;">
+        纯 CPU 任务：不分配任何 GPU，<n-text code>CUDA_VISIBLE_DEVICES</n-text> 会被设为空。
+        它不占显存，但受 <n-text code>scheduler.maxCpuTasks</n-text> 的并发上限约束。
+      </n-alert>
+
       <!-- 单卡时维持原来的单框外观，不给绝大多数任务增加认知负担 -->
       <n-form-item v-if="form.memGbs.length === 1" label="显存需求（GB）">
         <n-input-number v-model:value="form.memGbs[0]" :min="0.1" :step="0.5" style="width: 100%;" />
       </n-form-item>
 
       <!-- 多卡时把槽位语义摆在脸上：第 i 个框就是脚本里的 cuda:i -->
-      <n-form-item v-else label="每张卡的显存需求（GB）">
+      <n-form-item v-else-if="form.memGbs.length > 1" label="每张卡的显存需求（GB）">
         <n-space :size="12" style="width: 100%;">
           <div v-for="(_, i) in form.memGbs" :key="i">
             <n-text depth="3" style="font-size: 12px; display: block; margin-bottom: 4px;">
@@ -235,16 +253,14 @@ async function submit () {
       </n-form-item>
 
       <n-form-item label="命令">
-        <n-input
-          v-model:value="form.command"
-          type="textarea"
-          :autosize="{ minRows: 3, maxRows: 8 }"
-          placeholder="/home/you/miniconda3/envs/torch/bin/python train.py --lr 3e-5"
-        />
+        <CommandEditor v-model:value="form.command" />
       </n-form-item>
       <n-text depth="3" style="font-size: 12px; display: block; margin: -12px 0 16px; line-height: 1.6;">
         建议直接写 python 绝对路径，绕开 conda activate（非交互 shell 里它默认不可用）。<br />
-        <template v-if="form.memGbs.length === 1">
+        <template v-if="form.memGbs.length === 0">
+          这是纯 CPU 任务，脚本看不到任何 GPU——命令里不要出现 <n-text code>cuda</n-text>。
+        </template>
+        <template v-else-if="form.memGbs.length === 1">
           分流由 CUDA_VISIBLE_DEVICES 完成，代码中请统一使用 <n-text code>cuda:0</n-text>，不要硬编码卡号。
         </template>
         <template v-else>
@@ -301,24 +317,14 @@ async function submit () {
         </n-space>
       </n-form-item>
 
-      <n-alert v-if="warnings.length" type="warning" :title="warningTitle">
-        <div v-for="(w, i) in warnings" :key="i">{{ w }}</div>
-      </n-alert>
     </n-form>
 
     <template #footer>
       <n-space justify="end">
-        <!-- 提交成功后按钮整组换掉：此时「取消」撤销不了任何东西，
-             而再点一次「提交到队列」会建出重复任务 -->
-        <template v-if="submitted">
-          <n-button type="primary" @click="emit('update:show', false)">知道了</n-button>
-        </template>
-        <template v-else>
-          <n-button @click="emit('update:show', false)">取消</n-button>
-          <n-button type="primary" :loading="submitting" @click="submit">
-            {{ editTask ? '保存' : '提交到队列' }}
-          </n-button>
-        </template>
+        <n-button @click="emit('update:show', false)">取消</n-button>
+        <n-button type="primary" :loading="submitting" @click="submit">
+          {{ editTask ? '保存' : '提交到队列' }}
+        </n-button>
       </n-space>
     </template>
   </n-modal>
