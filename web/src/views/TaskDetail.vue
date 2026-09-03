@@ -242,14 +242,6 @@ const envEntries = computed(() => Object.entries(task.value?.env ?? {}))
             </n-gi>
           </n-grid>
 
-          <!-- 命令单独成块，不塞进上面的描述列表。
-               n-descriptions 是 table 布局，格子里放一个 width:100% 的编辑器会让
-               浏览器把宽度全分给这一列，把左边的 label 挤成竖排单字。
-               何况命令本来就常常很长，独占一块也更好读 -->
-          <n-card size="small" title="命令" style="margin-bottom: 16px;">
-            <CommandEditor :value="task.command" readonly :min-rows="1" :max-rows="16" />
-          </n-card>
-
           <n-card size="small" title="配置" style="margin-bottom: 16px;">
             <n-descriptions :column="2" label-placement="left" size="small" bordered>
               <n-descriptions-item label="工作目录">
@@ -308,6 +300,14 @@ const envEntries = computed(() => Object.entries(task.value?.env ?? {}))
                 </n-space>
               </n-descriptions-item>
             </n-descriptions>
+          </n-card>
+
+          <!-- 命令单独成块，不塞进上面的描述列表。
+               n-descriptions 是 table 布局，格子里放一个 width:100% 的编辑器会让
+               浏览器把宽度全分给这一列，把左边的 label 挤成竖排单字。
+               何况命令本来就常常很长，独占一块也更好读 -->
+          <n-card size="small" title="命令" style="margin-bottom: 16px;">
+            <CommandEditor :value="task.command" readonly :min-rows="1" :max-rows="16" />
           </n-card>
 
           <n-card size="small" title="日志">
