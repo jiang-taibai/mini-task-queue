@@ -8,6 +8,7 @@ import { getDb } from './db.js'
 import { GpuMonitor } from './gpu/index.js'
 import { Runner } from './runner.js'
 import { Scheduler } from './scheduler.js'
+import { acquireLock, takeover, describeHolder } from './lock.js'
 import { SessionStore, LoginLimiter, createAuthMiddleware } from './auth.js'
 import { createTasksRouter } from './routes/tasks.js'
 import { createEventsRouter } from './routes/events.js'
@@ -64,6 +65,50 @@ app.use((err, req, res, next) => {
   res.status(err.status || 500).json({ error: err.message || '服务器内部错误' })
 })
 
+/**
+ * 抢单实例锁，抢不到就退出。
+ *
+ * 必须在 scheduler.start() 之前完成。调度器一旦跑起来就会派任务、写库、
+ * spawn 进程，而多开的实例在运行时没有任何症状——端口只有一个能绑上，
+ * 绑不上的那几个照样调度。
+ */
+async function claimSingleInstance () {
+  const lockPath = path.join(cfg.dataDir, 'server.lock')
+  let lock = acquireLock(lockPath)
+
+  if (!lock.ok && lock.holder && process.argv.includes('--takeover')) {
+    console.log(`[lock] 已有实例在运行（${describeHolder(lock.holder)}），正在请求它退出……`)
+    const result = await takeover(lockPath, lock.holder)
+    if (!result.ok) {
+      console.error(`[lock] 接管失败：${result.reason}`)
+      console.error('[lock] 请手动确认那个进程的状态，不要用 kill -9——它会跳过关库流程')
+      process.exit(1)
+    }
+    console.log('[lock] 旧实例已退出')
+    lock = acquireLock(lockPath)
+  }
+
+  if (!lock.ok) {
+    console.error(`\n[lock] 已有实例在运行（${describeHolder(lock.holder)}），本进程退出。`)
+    console.error('  同一个 data/ 上跑多个实例会让多个调度器抢同一个队列：')
+    console.error('  重复派发、同一个任务起两个进程、显存账本对不上。')
+    console.error('\n  要替换正在跑的那个：npm start -- --takeover')
+    console.error('  （正在跑的任务不受影响，它们是独立进程组，新实例起来后会重新认领）\n')
+    process.exit(1)
+  }
+
+  // 覆盖所有退出路径：正常 shutdown、未捕获异常、process.exit
+  process.on('exit', () => lock.release())
+}
+
+/** listen 失败必须让进程真的失败——否则调度器会在一个「启动失败」的进程里继续跑 */
+function listen () {
+  return new Promise((resolve, reject) => {
+    const server = app.listen(cfg.port, cfg.host, () => resolve(server))
+    server.on('error', reject)
+  })
+}
+
 async function main () {
   if (!cfg.auth.salt || !cfg.auth.hash) {
     console.warn('\n⚠️  尚未设置登录密码，任何人都无法登录。请先运行：npm run setup\n')
@@ -71,6 +116,8 @@ async function main () {
   if ((cfg.allowedOrigins ?? []).length === 0) {
     console.warn('⚠️  allowedOrigins 为空，CSRF 的 Origin 校验已跳过（仅依赖 Cookie 的 SameSite=Strict）')
   }
+
+  await claimSingleInstance()
 
   try {
     await gpu.start()
@@ -81,15 +128,16 @@ async function main () {
     console.error('[gpu] 启动失败，调度将保持暂停：', err.message)
   }
 
+  // 先确认端口真的拿到了，再启动调度器。反过来的话，一个绑不上端口的进程
+  // 也会开始派任务——线上那 5 个幽灵调度器就是这么来的
+  await listen()
   scheduler.start()
 
-  app.listen(cfg.port, cfg.host, () => {
-    console.log(`\n  mini-task-queue 已启动`)
-    console.log(`  监听 http://${cfg.host}:${cfg.port}`)
-    console.log(`  数据目录 ${cfg.dataDir}`)
-    console.log(`\n  提示：用 tmux 或 nohup 启动，否则 SSH 断开会让服务被 SIGHUP 终止`)
-    console.log(`  （已在跑的任务不受影响，但队列会停止调度）\n`)
-  })
+  console.log(`\n  mini-task-queue 已启动`)
+  console.log(`  监听 http://${cfg.host}:${cfg.port}`)
+  console.log(`  数据目录 ${cfg.dataDir}`)
+  console.log(`\n  提示：用 tmux 或 nohup 启动，否则 SSH 断开会让服务被 SIGHUP 终止`)
+  console.log(`  （已在跑的任务不受影响，但队列会停止调度）\n`)
 }
 
 function shutdown (signal) {
@@ -108,6 +156,12 @@ process.on('SIGINT', () => shutdown('SIGINT'))
 process.on('SIGTERM', () => shutdown('SIGTERM'))
 
 main().catch(err => {
-  console.error('启动失败：', err)
+  if (err?.code === 'EADDRINUSE') {
+    console.error(`\n启动失败：端口 ${cfg.port} 已被占用。`)
+    console.error('  若占用者是本服务的另一个实例：npm start -- --takeover')
+    console.error('  否则改 config.json 里的 port，或用 PORT=xxxx npm start\n')
+  } else {
+    console.error('启动失败：', err)
+  }
   process.exit(1)
 })

@@ -11,6 +11,7 @@
     "setup": "node server/setup.js",
     "test": "node --test server/*.test.js",
     "start": "node server/index.js",
+    "stop": "node server/stop.js",
     "dev": "concurrently -n server,web -c blue,green \"node --watch server/index.js\" \"vite\"",
     "build": "vite build"
   },
