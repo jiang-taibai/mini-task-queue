@@ -241,12 +241,13 @@ export class Scheduler extends EventEmitter {
     const now = Date.now()
     this.db.exec('BEGIN')
     try {
+      // queued_at 重置：它重新开始排队了，等待时长不该沿用上一轮
       this.db.prepare(`
         UPDATE tasks
         SET status = 'pending', pid = NULL, pgid = NULL, proc_starttime = NULL,
-            gpu_index = NULL, gpu_indices = NULL, started_at = NULL, fail_reason = ?
+            gpu_index = NULL, gpu_indices = NULL, started_at = NULL, queued_at = ?, fail_reason = ?
         WHERE id = ?
-      `).run(reason, task.id)
+      `).run(now, reason, task.id)
 
       this.db.prepare(`
         UPDATE attempts SET finished_at = ?, outcome = 'oom_requeue' WHERE task_id = ? AND attempt_no = ?
@@ -413,6 +414,16 @@ export class Scheduler extends EventEmitter {
     return byGpu
   }
 
+  /**
+   * 正在跑的纯 CPU 任务数。
+   *
+   * 判据用 gpuMems 而不是 gpuIndices：后者在任务落库前是空的，会把一个正在启动的
+   * GPU 任务误算成 CPU 任务。gpuMems 是提交时就定死的声明，不受生命周期影响。
+   */
+  countRunningCpuTasks () {
+    return this.getRunning().filter(t => t.gpuMems.length === 0).length
+  }
+
   // —— 派发 ——
 
   /**
@@ -453,6 +464,7 @@ export class Scheduler extends EventEmitter {
 
   dispatch () {
     const runningByGpu = this.countRunningByGpu()
+    let cpuRunning = this.countRunningCpuTasks()
 
     for (const task of this.getQueue()) {
       // 严格门控：队头排不上，后面的一律等待。
@@ -467,6 +479,19 @@ export class Scheduler extends EventEmitter {
       // 抢同一个 attemptNo。等一拍即可——落库后它就变 running 了
       if (this.launching.has(task.id)) break
 
+      // 纯 CPU 任务不占显存，maxPerGpu 那道闸门对它不起作用。没有独立上限的话，
+      // 队列里十几个预处理任务会被一拍接一拍全部派出去，把机器压垮——
+      // 而那台机器上还有同事在用
+      if (task.gpuMems.length === 0) {
+        if (cpuRunning >= this.cfg.scheduler.maxCpuTasks) break
+        try {
+          if (this.launchTask(task, [])) cpuRunning++
+        } catch (err) {
+          this.failLaunch(task, err)
+        }
+        break
+      }
+
       const gpuIndices = this.pickGpus(task, runningByGpu)
       if (gpuIndices === null) break
 
@@ -475,17 +500,20 @@ export class Scheduler extends EventEmitter {
           for (const idx of gpuIndices) runningByGpu.set(idx, (runningByGpu.get(idx) ?? 0) + 1)
         }
       } catch (err) {
-        // launch 同步抛出时 promise 回调不会跑，标记得在这里清掉——
-        // 漏一次这个任务就再也不会被派发，而且不会有任何报错
-        this.launching.delete(task.id)
-        console.error(`[scheduler] 启动任务 #${task.id} 失败:`, err)
-        this.db.prepare(`
-          UPDATE tasks SET status = 'failed', finished_at = ?, fail_reason = ? WHERE id = ?
-        `).run(Date.now(), `启动失败：${err.message}`, task.id)
-        this.emitChange(task.id)
+        this.failLaunch(task, err)
       }
       break // 一拍只派一个：给账本和监控留出反应时间，避免瞬间超派
     }
+  }
+
+  /** launch 同步抛出时的收尾。标记漏清一次，这个任务就再也不会被派发，而且不会有任何报错 */
+  failLaunch (task, err) {
+    this.launching.delete(task.id)
+    console.error(`[scheduler] 启动任务 #${task.id} 失败:`, err)
+    this.db.prepare(`
+      UPDATE tasks SET status = 'failed', finished_at = ?, fail_reason = ? WHERE id = ?
+    `).run(Date.now(), `启动失败：${err.message}`, task.id)
+    this.emitChange(task.id)
   }
 
   /**
@@ -515,6 +543,8 @@ export class Scheduler extends EventEmitter {
     const now = Date.now()
     const expiresAt = now + this.cfg.scheduler.warmupSeconds * 1000
     const indicesJson = JSON.stringify(gpuIndices)
+    // 纯 CPU 任务没有槽位 0。显式转成 null——undefined 绑不进 SQLite
+    const slotZero = gpuIndices[0] ?? null
 
     // launch 是异步的，但派发必须同步完成账本记账，否则同一拍的后续决策会看到旧数据。
     // 这里先占坑，再实际启动。每张卡一条，各自独立解除。
@@ -538,12 +568,12 @@ export class Scheduler extends EventEmitter {
               started_at = ?, retry_count = ?,
               finished_at = NULL, exit_code = NULL, fail_reason = NULL
           WHERE id = ?
-        `).run(gpuIndices[0], indicesJson, pid, pgid, procStarttime, now, retryCount, task.id)
+        `).run(slotZero, indicesJson, pid, pgid, procStarttime, now, retryCount, task.id)
 
         this.db.prepare(`
           INSERT INTO attempts (task_id, attempt_no, gpu_index, gpu_indices, pid, pgid, started_at, log_path)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(task.id, attemptNo, gpuIndices[0], indicesJson, pid, pgid, now, logPath)
+        `).run(task.id, attemptNo, slotZero, indicesJson, pid, pgid, now, logPath)
         this.db.exec('COMMIT')
       } catch (err) {
         this.db.exec('ROLLBACK')
@@ -553,7 +583,8 @@ export class Scheduler extends EventEmitter {
 
       this.launching.delete(task.id)
       this.gpu.mock?.noteTaskStart(pgid, gpuIndices, task.gpuMems)
-      this.emit('log', `任务 #${task.id}「${task.name}」已派往 GPU ${gpuIndices.join('、')}（第 ${attemptNo} 次尝试）`)
+      const target = gpuIndices.length ? `已派往 GPU ${gpuIndices.join('、')}` : '已启动（纯 CPU，不占卡）'
+      this.emit('log', `任务 #${task.id}「${task.name}」${target}（第 ${attemptNo} 次尝试）`)
       this.emitChange(task.id)
     }).catch(err => {
       this.launching.delete(task.id)
@@ -843,6 +874,23 @@ export class Scheduler extends EventEmitter {
 
     const head = queue[0]
     const runningByGpu = this.countRunningByGpu()
+
+    // 纯 CPU 队头单独判定：pickGpus 对它永远返回 []（不是 null），
+    // 走下面那条会被当成「排得上」，于是被 CPU 闸门挡住时界面上什么都不显示
+    if (head.status !== 'blocked' && head.gpuMems.length === 0) {
+      const limit = this.cfg.scheduler.maxCpuTasks
+      if (this.countRunningCpuTasks() < limit) return null
+      return {
+        taskId: head.id,
+        taskName: head.name,
+        status: head.status,
+        reason: `已有 ${limit} 个纯 CPU 任务在跑，达到并发上限（scheduler.maxCpuTasks）`,
+        waitingMs: Date.now() - head.queuedAt,
+        queueLength: queue.length,
+        idleGpus: []
+      }
+    }
+
     if (this.pickGpus(head, runningByGpu) !== null) return null
 
     const idleGpus = this.gpu.getDevices()
@@ -856,7 +904,7 @@ export class Scheduler extends EventEmitter {
       reason: head.status === 'blocked'
         ? `等待依赖 ${head.dependsOn.map(id => '#' + id).join('、')} 完成`
         : this.describeMemoryWait(head),
-      waitingMs: Date.now() - head.createdAt,
+      waitingMs: Date.now() - head.queuedAt,
       queueLength: queue.length,
       idleGpus
     }

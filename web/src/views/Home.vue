@@ -13,6 +13,7 @@ import {
   state, runningTasks, queuedTasks, finishedTasks, finishedSort, refreshAll, disconnectEvents
 } from '../store.js'
 import { toggleTheme, isDark } from '../theme.js'
+import { persistedRef } from '../prefs.js'
 
 const router = useRouter()
 const message = useMessage()
@@ -45,7 +46,8 @@ const processesByGpu = computed(() => {
   return map
 })
 
-const showFinished = ref(false)
+// 记住展开状态：翻结果时刷新一下整栏就收起来，很打断
+const showFinished = persistedRef('mtq-show-finished', false)
 
 const sortOptions = [
   { label: '按序号', value: 'id' },

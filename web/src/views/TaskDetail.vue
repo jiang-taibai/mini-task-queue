@@ -84,6 +84,18 @@ function outcomeLabel (outcome) {
   }[outcome] ?? '运行中'
 }
 
+/**
+ * 站内跳到另一个任务。
+ *
+ * 带 ctrl/cmd/shift 或中键时直接返回，让 <a href> 走浏览器原生行为——
+ * 这正是「在新标签页打开」赖以工作的机制，拦下来就没了。
+ */
+function openTask (id, e) {
+  if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey || e.button !== 0) return
+  e.preventDefault()
+  router.push(`/task/${id}`)
+}
+
 async function load () {
   try {
     detail.value = await api.getTask(props.id)
@@ -250,32 +262,36 @@ const envEntries = computed(() => Object.entries(task.value?.env ?? {}))
                   <n-text code>{{ k }}={{ v }}</n-text>
                 </div>
               </n-descriptions-item>
+              <!-- n-tag 不是链接元素，外面套一层真 <a>：带修饰键的点击交还浏览器，
+                   「Ctrl+点击开新标签」才不会失灵 -->
               <n-descriptions-item v-if="detail.dependencies.length" label="前置任务" :span="2">
                 <n-space :size="6">
-                  <n-tag
+                  <a
                     v-for="d in detail.dependencies"
                     :key="d.id"
-                    size="small"
-                    :type="STATUS_META[d.status]?.type ?? 'default'"
-                    style="cursor: pointer;"
-                    @click="router.push(`/task/${d.id}`)"
+                    class="tag-link"
+                    :href="`/task/${d.id}`"
+                    @click="e => openTask(d.id, e)"
                   >
-                    #{{ d.id }} {{ d.name }}
-                  </n-tag>
+                    <n-tag size="small" :type="STATUS_META[d.status]?.type ?? 'default'">
+                      #{{ d.id }} {{ d.name }}
+                    </n-tag>
+                  </a>
                 </n-space>
               </n-descriptions-item>
               <n-descriptions-item v-if="detail.dependents.length" label="下游任务" :span="2">
                 <n-space :size="6">
-                  <n-tag
+                  <a
                     v-for="d in detail.dependents"
                     :key="d.id"
-                    size="small"
-                    :type="STATUS_META[d.status]?.type ?? 'default'"
-                    style="cursor: pointer;"
-                    @click="router.push(`/task/${d.id}`)"
+                    class="tag-link"
+                    :href="`/task/${d.id}`"
+                    @click="e => openTask(d.id, e)"
                   >
-                    #{{ d.id }} {{ d.name }}
-                  </n-tag>
+                    <n-tag size="small" :type="STATUS_META[d.status]?.type ?? 'default'">
+                      #{{ d.id }} {{ d.name }}
+                    </n-tag>
+                  </a>
                 </n-space>
               </n-descriptions-item>
             </n-descriptions>
@@ -316,6 +332,9 @@ const envEntries = computed(() => Object.entries(task.value?.env ?? {}))
 </template>
 
 <style scoped>
+.tag-link {
+  text-decoration: none;
+}
 .header {
   display: flex;
   align-items: center;

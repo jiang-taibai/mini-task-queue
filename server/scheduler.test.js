@@ -364,6 +364,77 @@ test('记账失败时杀掉已经 spawn 的进程，不留下账本之外的显�
   assert.equal(scheduler.reservations.has(id), false)
 })
 
+test('纯 CPU 任务不占卡，CUDA_VISIBLE_DEVICES 为空', async () => {
+  const { db, scheduler, runner, pump } = setup()
+  const id = addTask(db, [])
+
+  pump()
+  scheduler.tick()
+  await settle()
+
+  assert.deepEqual(runner.launched[0].gpuIndices, [], '不该分配任何卡')
+  assert.equal(scheduler.reservedOn(0), 0, '纯 CPU 任务不能占用显存账本')
+  assert.equal(scheduler.reservedOn(1), 0)
+
+  const task = scheduler.getTask(id)
+  assert.equal(task.status, 'running')
+  assert.deepEqual(task.gpuIndices, [])
+  assert.equal(task.gpuIndex, null, 'undefined 绑不进 SQLite，必须显式转成 null')
+})
+
+test('纯 CPU 任务达到并发上限后不再派发', async () => {
+  const { cfg, db, scheduler, runner, pump } = setup()
+  cfg.scheduler.maxCpuTasks = 2
+  for (let i = 0; i < 3; i++) addTask(db, [])
+
+  // 一拍派一个，跑三拍
+  for (let i = 0; i < 3; i++) {
+    pump()
+    scheduler.tick()
+    await settle()
+  }
+
+  assert.equal(
+    runner.launched.length, 2,
+    'CPU 任务不占显存，maxPerGpu 管不到它们——没有独立闸门就会一次性全部派出去'
+  )
+})
+
+test('纯 CPU 任务不占卡，因此不挡住后面的 GPU 任务排卡', async () => {
+  const { cfg, db, scheduler, runner, pump } = setup()
+  cfg.scheduler.maxCpuTasks = 4
+  addTask(db, [])          // 队头：纯 CPU
+  addTask(db, [10000])     // 后面：单卡
+
+  pump()
+  scheduler.tick()
+  await settle()
+  pump()
+  scheduler.tick()
+  await settle()
+
+  assert.equal(runner.launched.length, 2)
+  assert.deepEqual(runner.launched[0].gpuIndices, [])
+  assert.deepEqual(runner.launched[1].gpuIndices, [0], 'CPU 队头没占卡，GPU 任务该照常排上')
+})
+
+test('CPU 闸门满时，队头的等待原因要能说出来', async () => {
+  const { cfg, db, scheduler, pump } = setup()
+  cfg.scheduler.maxCpuTasks = 1
+  addTask(db, [])
+  addTask(db, [])
+
+  pump()
+  scheduler.tick()
+  await settle()
+  pump()
+  scheduler.tick()
+
+  const info = scheduler.getBlockingInfo()
+  assert.ok(info, 'pickGpus 对 0 卡任务返回 [] 而不是 null，不特判的话界面上什么都不显示')
+  assert.match(info.reason, /并发上限/)
+})
+
 test('gpu_mems 为空的历史行回退成单卡，不会炸', async () => {
   const { db, scheduler } = setup()
   const info = db.prepare(`

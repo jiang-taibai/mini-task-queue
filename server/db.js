@@ -47,6 +47,10 @@ function migrate (db) {
       stop_requested  INTEGER NOT NULL DEFAULT 0,
 
       created_at      INTEGER NOT NULL,
+      -- 最近一次进入队列的时刻，「已等待」由它算起。
+      -- 与 created_at 分开：重新排队后等待时长应当归零，否则一个昨天创建、
+      -- 今天重排的任务会显示「已等待 20 小时」，而它其实刚排上队
+      queued_at       INTEGER,
       started_at      INTEGER,
       finished_at     INTEGER,
 
@@ -107,6 +111,12 @@ function migrate (db) {
     // 只在列刚建出来时回填：retry_count 为 0 是手动重排后的正常状态，
     // 每次启动都跑一遍会把重排过的任务的重试预算又填满
     db.exec('UPDATE tasks SET retry_count = attempt_count')
+  }
+
+  // 「已等待」的计时起点。只在列刚建出来时回填成 created_at——历史行没有更好的
+  // 依据，而每次启动都跑一遍会把重排过的任务的等待时长又打回创建时间
+  if (addColumnIfMissing(db, 'tasks', 'queued_at', 'INTEGER')) {
+    db.exec('UPDATE tasks SET queued_at = created_at')
   }
 
   repairDuplicateAttempts(db)
@@ -212,6 +222,8 @@ export function rowToTask (row) {
     procStarttime: row.proc_starttime,
     stopRequested: !!row.stop_requested,
     createdAt: row.created_at,
+    // 兜底到 created_at：回退过版本的话，旧代码写的行没有这一列
+    queuedAt: row.queued_at ?? row.created_at,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
     exitCode: row.exit_code,

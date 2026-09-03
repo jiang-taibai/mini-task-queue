@@ -190,6 +190,60 @@ test('仍接受旧的 memRequiredMb 单值写法', async () => {
   assert.deepEqual(body.task.gpuMems, [4096])
 })
 
+test('0 卡任务（纯 CPU）提交成功', async () => {
+  const { status, body } = await post({ gpuMems: [] })
+
+  assert.equal(status, 201)
+  assert.deepEqual(body.task.gpuMems, [])
+  assert.equal(body.task.memRequiredMb, 0)
+})
+
+test('两个显存字段都没传 -> 仍然拒绝，不静默当成纯 CPU', async () => {
+  const { status, body } = await post({})
+
+  assert.equal(
+    status, 400,
+    '字段名写错的请求会走到这里。静默建成 CPU 任务的话，用户要等到 GPU 用不了才发现'
+  )
+  assert.match(body.error, /至少要声明一张卡/)
+})
+
+test('0 卡任务的命令里出现 cuda: -> 警告不拦', async () => {
+  const { status, body } = await post({
+    gpuMems: [],
+    command: 'python infer.py --device cuda:0'
+  })
+
+  assert.equal(status, 201)
+  assert.ok(
+    body.warnings.some(w => w.includes('纯 CPU') && w.includes('CUDA_VISIBLE_DEVICES')),
+    `应提醒该任务看不到 GPU，实际：${JSON.stringify(body.warnings)}`
+  )
+})
+
+test('新建任务的 queuedAt 等于 createdAt，重新排队后归零', async () => {
+  const { body } = await post({ gpuMems: [1000] })
+  const id = body.task.id
+
+  assert.equal(body.task.queuedAt, body.task.createdAt, '刚建的任务，两个时刻是同一个')
+
+  // 伪造成一个昨天创建、跑失败了的任务
+  const yesterday = Date.now() - 24 * 3600 * 1000
+  db.prepare(`
+    UPDATE tasks SET status = 'failed', created_at = ?, queued_at = ?, finished_at = ?
+    WHERE id = ?
+  `).run(yesterday, yesterday, Date.now(), id)
+
+  const res = await fetch(`${base}/api/tasks/${id}/requeue`, { method: 'POST' })
+  const task = (await res.json()).task
+
+  assert.equal(task.createdAt, yesterday, '创建时刻是事实，不该被改')
+  assert.ok(
+    Date.now() - task.queuedAt < 5000,
+    '等待时长要从「这一次排上队」算起，否则界面上会显示「已等待 24 小时」'
+  )
+})
+
 test('重新排队只清空重试预算，尝试编号继续往后走', async () => {
   const { body } = await post({ gpuMems: [1000] })
   const id = body.task.id

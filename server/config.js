@@ -45,6 +45,9 @@ const DEFAULTS = {
     // 从启动到 nvidia-smi 能观测到显存被吃掉之间的盲区，账本在此期间挂着预留
     warmupSeconds: 60,
     maxPerGpu: 1,
+    // 纯 CPU 任务（0 张卡）的并发上限。它们不占显存，maxPerGpu 管不到，
+    // 没有这个闸门的话队列里所有 CPU 任务会被一拍接一拍全部派出去
+    maxCpuTasks: 4,
     maxRetries: 3,
     // 运行时长低于此值且日志含 OOM 关键字 -> 判定为抢卡失败而非真失败
     oomWindowSeconds: 90,
