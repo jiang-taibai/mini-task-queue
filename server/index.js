@@ -14,6 +14,28 @@ import { createTasksRouter } from './routes/tasks.js'
 import { createEventsRouter } from './routes/events.js'
 import { createSystemRouter } from './routes/system.js'
 
+/**
+ * 这个文件是服务入口，不是测试文件——被 test runner 加载就是个事故。
+ *
+ * `node --test server/` 会把目录下每个文件都当测试跑，包括这一个。它没有
+ * 任何 test() 用例，于是「跑」的方式就是从头执行一遍：打开数据库、跑迁移、
+ * 启动调度器、占住端口。测试跑完 runner 退出了，这个服务却留在后台，
+ * 拿着 data/queue.db 继续派发任务——一个谁都不知道它存在的调度器。
+ *
+ * 真发生过一次：进程活了近两个小时，而 `pgrep -f 'node server/index.js'`
+ * 找不到它（它的命令行是 `node --test ... server`）。
+ *
+ * npm test 用的是 server/*.test.js 通配，不会碰到这里；这道闸门防的是
+ * 手滑写成目录的那次。必须放在 getDb() 之前——那一行就已经在动数据库了。
+ */
+if (process.env.NODE_TEST_CONTEXT) {
+  console.error('\n[启动被拒绝] server/index.js 被 Node test runner 加载了。')
+  console.error('  它是服务入口而非测试文件，跑起来会占用端口并连上数据库跑调度器。')
+  console.error('  跑测试请用：npm test（等价于 node --test server/*.test.js）')
+  console.error('  不要用：node --test server/\n')
+  process.exit(1)
+}
+
 const cfg = loadConfig()
 const db = getDb()
 const gpu = new GpuMonitor(cfg)
